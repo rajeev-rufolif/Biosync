@@ -25,11 +25,16 @@ Then open `.env` and fill in:
 - `FLASK_SECRET_KEY` — any random string
 - `GROQ_API_KEY` — free, from https://console.groq.com (used by chat_handler.py
   and syllabus_structurer.py by default)
-- `ANTHROPIC_API_KEY` — only needed because schedule_generator.py defaults to
-  Claude (this is the one step where we deliberately chose quality over cost —
-  see that file's docstring). If you don't have a Claude key, open
-  schedule_generator.py and change `PROVIDER = "claude"` to `PROVIDER = "groq"`
-  near the top of the file — one line, no other changes needed.
+- `GROQ_API_KEY` is the only LLM key required: chat_handler.py,
+  syllabus_structurer.py and schedule_generator.py all have `PROVIDER = "groq"`
+  near the top of the file, so Groq (free tier) is the default everywhere.
+- `ANTHROPIC_API_KEY` — optional. Only needed if you switch a step to Claude
+  by changing that file's `PROVIDER = "groq"` to `PROVIDER = "claude"` (one
+  line per file). schedule_generator.py is the step where Claude is most worth
+  it if Groq's free-tier quality or rate limits become a problem.
+- `DEFAULT_LLM_PROVIDER` — only used by `llm_client.ask()` when a caller passes
+  no provider. All three scripts pass one explicitly, so changing this value
+  does not by itself switch them.
 
 ## 4. Run it
 ```
@@ -58,7 +63,7 @@ of talking to the real backend.
 | `chat_handler.py` | Asks the fixed checklist of questions | Yes (Groq) |
 | `document_parser.py` | Extracts text from PDF/Word/Excel/image uploads | No — plain code + OCR |
 | `syllabus_structurer.py` | Turns messy extracted text into structured subject data | Yes (Groq) |
-| `schedule_generator.py` | Builds the actual weekly schedule (circadian rhythm reasoning) | Yes (Claude by default) |
+| `schedule_generator.py` | Builds the actual weekly schedule (circadian rhythm reasoning) | Yes (Groq by default; Claude optional) |
 | `app.py` | Flask routes tying it all together, matches the frontend's exact API contract | — |
 
 ## API contract note: `/api/schedule` response shape
@@ -75,6 +80,15 @@ object (not a bare array):
   "subject_breakdown": [ { "subject": "Data Structures", "hours_this_week": 4 } ]
 }
 ```
+The object also carries `status` (`"pending"` = chat not finished,
+`"ready"`, or `"failed"`), plus `error` and `reason` when `status` is
+`"failed"`. `reason` is `rate_limited` (the LLM provider's rate limit was hit),
+`generation_failed` (any other LLM failure or unreadable reply), or
+`internal_error` (unexpected backend crash); `error` is a user-safe message —
+the raw provider error is only written to the server log. A failure is still
+HTTP 200: the signal is in the body. `POST /api/schedule/retry` re-runs the
+pipeline after a failure and returns the same shape.
+
 `type` is one of `study` / `break` / `meal` / `sleep` / `class` / `other`,
 and `energy` is `high` / `medium` / `low` — both come straight from
 `schedule_generator.py`'s prompt, not computed separately. The results
@@ -93,3 +107,7 @@ breaks if an older backend build is swapped in.
   layer (only for standalone image files) — a scanned PDF syllabus may come
   back empty.
 - Legacy `.doc` (not `.docx`) files are not supported — only `.docx`.
+  (Legacy `.xls` *is* supported, via `xlrd`.)
+- Groq's free tier is rate-limited. When it rejects a request the results
+  page says so and offers a retry, plus a clearly labeled example schedule.
+  The example is also available any time at `results.html?example=1`.
