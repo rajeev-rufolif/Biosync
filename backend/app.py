@@ -6,7 +6,10 @@ script.js, built by teammate) and the 4 pipeline scripts.
 Routes match the EXACT contract already implemented in script.js:
   POST /api/chat      -> {"message": "..."}           => {"reply": "...", "done": bool}
   POST /api/upload     -> multipart form, field "file"  => {"status": "received" | "failed", "error"?: "..."}
-  GET  /api/schedule   -> (no body)                     => [ {day, blocks:[{time, activity}]} ... ]
+  GET  /api/schedule   -> (no body)                     => {"status": "pending"|"ready"|"failed", "schedule": [...], ...}
+                                                           (full shape documented above api_schedule())
+  POST /api/schedule/retry -> (no body)                 => same shape as GET /api/schedule, after re-running
+                                                           the pipeline if the last attempt failed
 
 Session handling: single global dict keyed by Flask session cookie id.
 No login system in this MVP — one browser session = one in-progress
@@ -23,6 +26,7 @@ To run:
 """
 
 import os
+import re
 import logging
 from flask import Flask, request, jsonify, session, send_from_directory
 from werkzeug.utils import secure_filename
@@ -91,10 +95,22 @@ def serve_static(filename):
 # ---------------------------------------------------------------------
 # POST /api/chat
 # ---------------------------------------------------------------------
+@app.errorhandler(500)
+def handle_internal_error(e):
+    # Safety net: anything uncaught inside an /api/* route still comes back as
+    # JSON (script.js calls res.json()), never Flask's HTML error page. Flask
+    # has already logged the traceback by the time this runs.
+    if request.path.startswith("/api/"):
+        return jsonify({"error": "Something went wrong on the server. Please try again."}), 500
+    return e
+
+
 @app.route("/api/chat", methods=["POST"])
 def api_chat():
-    data = request.get_json(silent=True) or {}
-    user_message = data.get("message", "").strip()
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        data = {}
+    user_message = str(data.get("message") or "").strip()
 
     if not user_message:
         return jsonify({"reply": "Could you type something first?", "done": False}), 400
@@ -111,9 +127,30 @@ def api_chat():
     sdata["chat_state"] = updated_state
 
     if done:
-        _run_post_chat_pipeline(sdata)
+        # Never let a pipeline crash turn the final chat reply into a 500.
+        # The chat itself succeeded; if schedule building failed, that is
+        # recorded in sdata["schedule"] and surfaced by /api/schedule.
+        _run_pipeline_safely(sdata)
 
     return jsonify({"reply": reply, "done": done})
+
+
+def _run_pipeline_safely(sdata):
+    """
+    Runs _run_post_chat_pipeline() and guarantees it never raises. The LLM
+    helpers already return {"success": False, ...} for LLM/JSON failures;
+    this catches everything else (bad data shapes, KeyError, etc.) and
+    stores it as a failed schedule so /api/schedule can report it.
+    """
+    try:
+        _run_post_chat_pipeline(sdata)
+    except Exception:
+        logger.exception("Post-chat pipeline crashed unexpectedly")
+        sdata["schedule"] = {
+            "success": False,
+            "error": "Unexpected error while building the schedule.",
+            "reason": "internal_error",
+        }
 
 
 def _run_post_chat_pipeline(sdata):
@@ -186,40 +223,101 @@ def api_upload():
 # GET /api/schedule
 # Response shape (extended for the analytics view on results.html):
 #   {
+#     "status": "pending" | "ready" | "failed",
 #     "schedule": [ {day, focus_summary, blocks:[{time, activity, type,
 #                    subject, energy, note}]} ... ],
 #     "reasoning_notes": "...",
 #     "weekly_focus_hours": <number>,
-#     "subject_breakdown": [ {subject, hours_this_week} ... ]
+#     "subject_breakdown": [ {subject, hours_this_week} ... ],
+#     "error": null | "<user-facing message>",          (status == "failed")
+#     "reason": null | "rate_limited" | "generation_failed" | "internal_error"
 #   }
 # Kept as one object (not a bare array) so the frontend can read the
 # analytics fields alongside the day list without a second request.
+#
+# "pending" = the chat checklist hasn't finished, nothing has been built yet.
+# "failed"  = the pipeline ran and did NOT produce a schedule (e.g. the LLM
+#             provider rate-limited us). Always HTTP 200 — the signal is in the
+#             body, so a proxy in front of the app can't swallow it the way it
+#             could a 429/502/503 error page.
+# The raw provider exception text is only logged (schedule_generator.py), never
+# sent to the browser: it can contain org IDs and other internals.
 # ---------------------------------------------------------------------
-@app.route("/api/schedule", methods=["GET"])
-def api_schedule():
-    sdata = get_session_data()
-    result = sdata.get("schedule")
+SCHEDULE_ERROR_MESSAGES = {
+    "rate_limited": "The AI service hit its rate limit — try again shortly.",
+    "generation_failed": "The AI service couldn't build your schedule this time — try again shortly.",
+    "internal_error": "Something went wrong on our side while building your schedule — try again shortly.",
+}
+_RATE_LIMIT_PATTERN = re.compile(r"rate[ _-]?limit|too many requests|\b429\b", re.IGNORECASE)
 
-    empty = {
+
+def _classify_schedule_failure(result):
+    """
+    Map a failed pipeline result to a stable reason code. schedule_generator
+    only hands back an error string, so rate limits are recognised from the
+    provider's own error text (Groq and Anthropic both surface HTTP 429 /
+    "rate_limit" in it).
+    """
+    reason = result.get("reason")
+    if reason in SCHEDULE_ERROR_MESSAGES:
+        return reason
+    if _RATE_LIMIT_PATTERN.search(str(result.get("error") or "")):
+        return "rate_limited"
+    return "generation_failed"
+
+
+def _schedule_payload(sdata):
+    payload = {
+        "status": "pending",
         "schedule": [],
         "reasoning_notes": "",
         "weekly_focus_hours": None,
-        "subject_breakdown": []
+        "subject_breakdown": [],
+        "error": None,
+        "reason": None,
     }
+    result = sdata.get("schedule")
 
     if result is None:
         # Chat flow not finished yet / pipeline hasn't run.
-        return jsonify(empty), 200
+        return payload
 
     if not result.get("success"):
-        return jsonify(empty), 200
+        reason = _classify_schedule_failure(result)
+        payload.update(status="failed", reason=reason, error=SCHEDULE_ERROR_MESSAGES[reason])
+        return payload
 
-    return jsonify({
-        "schedule": result["schedule"],
-        "reasoning_notes": result.get("reasoning_notes") or "",
-        "weekly_focus_hours": result.get("weekly_focus_hours"),
-        "subject_breakdown": result.get("subject_breakdown") or []
-    })
+    payload.update(
+        status="ready",
+        schedule=result["schedule"],
+        reasoning_notes=result.get("reasoning_notes") or "",
+        weekly_focus_hours=result.get("weekly_focus_hours"),
+        subject_breakdown=result.get("subject_breakdown") or [],
+    )
+    return payload
+
+
+@app.route("/api/schedule", methods=["GET"])
+def api_schedule():
+    return jsonify(_schedule_payload(get_session_data()))
+
+
+# ---------------------------------------------------------------------
+# POST /api/schedule/retry
+# After a "failed" schedule the chat UI is already finished (input disabled),
+# so without this the only way to retry would be to redo the whole chat.
+# Re-runs the pipeline only if the chat is complete and the last attempt did
+# not produce a schedule — never regenerates (and replaces) a good one.
+# Returns the same shape as GET /api/schedule.
+# ---------------------------------------------------------------------
+@app.route("/api/schedule/retry", methods=["POST"])
+def api_schedule_retry():
+    sdata = get_session_data()
+    result = sdata.get("schedule")
+    last_attempt_failed = result is None or not result.get("success")
+    if chat_handler.is_complete(sdata["chat_state"]) and last_attempt_failed:
+        _run_pipeline_safely(sdata)
+    return jsonify(_schedule_payload(sdata))
 
 
 if __name__ == "__main__":

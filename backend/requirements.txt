@@ -5,6 +5,7 @@ groq
 pdfplumber
 python-docx
 openpyxl
+xlrd
 pytesseract
 Pillow
 werkzeug

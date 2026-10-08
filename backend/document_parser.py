@@ -97,6 +97,55 @@ def parse_xlsx(filepath):
     return "\n".join(text_parts).strip()
 
 
+def parse_xls(filepath):
+    """
+    Extract text from a legacy Excel (.xls) file via xlrd — openpyxl only
+    reads .xlsx. Same output shape as parse_xlsx(). Dates are converted
+    from Excel serial numbers to ISO dates so exam dates stay readable
+    for the syllabus-structuring step.
+
+    Files named .xls are sometimes really .xlsx (renamed, or saved by tools
+    that use the old extension). .xlsx is a zip container, so sniff the
+    first bytes and hand those to parse_xlsx() instead of failing.
+    """
+    with open(filepath, "rb") as f:
+        if f.read(2) == b"PK":
+            f.seek(0)
+            # Pass the open file, not the path: openpyxl rejects any *path*
+            # ending in ".xls" by name, but accepts a file object.
+            return parse_xlsx(f)
+
+    import xlrd  # imported here so a missing xlrd only affects .xls uploads
+
+    workbook = xlrd.open_workbook(filepath)
+    text_parts = []
+
+    for sheet in workbook.sheets():
+        text_parts.append(f"[Sheet: {sheet.name}]")
+        for row_idx in range(sheet.nrows):
+            row_values = []
+            for cell in sheet.row(row_idx):
+                if cell.ctype in (xlrd.XL_CELL_EMPTY, xlrd.XL_CELL_BLANK):
+                    continue
+                value = cell.value
+                if cell.ctype == xlrd.XL_CELL_DATE:
+                    try:
+                        value = xlrd.xldate_as_datetime(value, workbook.datemode).isoformat(sep=" ")
+                    except (xlrd.XLDateError, ValueError, OverflowError):
+                        pass  # keep the raw number rather than dropping the cell
+                elif cell.ctype == xlrd.XL_CELL_NUMBER and float(value).is_integer():
+                    value = int(value)  # 3.0 -> 3
+                elif cell.ctype == xlrd.XL_CELL_BOOLEAN:
+                    value = bool(value)
+                text = str(value).strip()
+                if text:
+                    row_values.append(text)
+            if row_values:
+                text_parts.append(" | ".join(row_values))
+
+    return "\n".join(text_parts).strip()
+
+
 def parse_image(filepath):
     """OCR an image file using pytesseract."""
     image = Image.open(filepath)
@@ -131,7 +180,9 @@ def parse_document(filepath, original_filename=None):
                 error="Old .doc format isn't supported — please upload as .docx.",
                 source_filename=display_name
             )
-        elif ext in ("xls", "xlsx"):
+        elif ext == "xls":
+            text = parse_xls(filepath)
+        elif ext == "xlsx":
             text = parse_xlsx(filepath)
         elif ext in ("png", "jpg", "jpeg", "webp"):
             text = parse_image(filepath)

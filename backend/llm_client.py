@@ -8,15 +8,15 @@ repeating client setup, error handling, and logging, they all import from
 here. One place to fix bugs, one place to swap models.
 
 Provider selection: each script passes its own `provider` argument
-("claude" or "groq") when it calls ask(). This lets us run Groq for the
-cheap/frequent steps (chat_handler, syllabus_structurer) and Claude for
-the one step where reasoning quality matters most (schedule_generator),
-while still letting you flip any single script to the other provider by
-changing one line — no API keys needed for Groq (free tier), Claude needs
-a paid key if you choose to use it there.
+("claude" or "groq") when it calls ask(). Today all three callers
+(chat_handler, syllabus_structurer, schedule_generator) pass "groq" — Groq's
+free tier needs a GROQ_API_KEY. Claude is supported as an alternate provider
+(needs ANTHROPIC_API_KEY); flip any single script to it by changing that
+script's PROVIDER constant — one line each.
 """
 
 import os
+import sys
 import logging
 import anthropic
 import groq
@@ -24,11 +24,15 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Log to stdout, NOT to a file. This is the first basicConfig() to run in the
+# process (app.py imports this module before its own basicConfig call, which
+# is then a no-op), so this config applies app-wide. A file inside the
+# container is invisible to Render's Logs tab (which only captures
+# stdout/stderr) and is wiped on every redeploy.
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
-    filename="biosync_backend.log",
-    filemode="a"
+    stream=sys.stdout
 )
 logger = logging.getLogger(__name__)
 

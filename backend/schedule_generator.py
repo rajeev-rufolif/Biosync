@@ -7,12 +7,11 @@ syllabus_structurer.py + lifestyle answers from chat_handler.py) and
 generate an actual weekly schedule, reasoned from real chronobiology/
 productivity principles rather than a generic template.
 
-Provider: Claude by default. This is the one step where output quality
-is the actual product — a generic, unreasoned schedule defeats the whole
-point of the tool, so this is where the better model is worth using even
-though it costs money (unlike the free Groq steps elsewhere in the
-pipeline). Can be switched to Groq via provider="groq" if you don't
-have a Claude key, at a likely quality cost.
+Provider: Groq by default (PROVIDER below), same as the other two LLM
+steps. This is the one step where output quality is the actual product —
+a generic, unreasoned schedule defeats the whole point of the tool — so if
+Groq's free-tier quality or rate limits become a problem, this is the step
+worth moving to Claude: set PROVIDER = "claude" (needs ANTHROPIC_API_KEY).
 
 Output is forced into the exact JSON shape results.html already expects
 (see script.js MOCK_SCHEDULE) — no translation layer needed in app.py.
@@ -24,7 +23,7 @@ from llm_client import ask
 
 logger = logging.getLogger(__name__)
 
-PROVIDER = "groq"  # change to "groq" here if you don't have a Claude API key
+PROVIDER = "groq"  # change to "claude" here to use Claude (needs ANTHROPIC_API_KEY)
 
 SYSTEM_PROMPT = """You are an expert in student time management, productivity, and \
 chronobiology. You build realistic, personalized weekly study schedules — not generic \
