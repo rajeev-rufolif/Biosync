@@ -38,6 +38,8 @@ a{color:inherit}
 .hero h1 mark{background:linear-gradient(transparent 58%,var(--mark) 58%);color:inherit}
 .hero p{font-size:20px;color:var(--muted);max-width:30ch;margin:22px 0 32px}
 .hero .actions{display:flex;gap:16px;flex-wrap:wrap}
+.hero .hero-note{font-size:14px;max-width:none;margin:18px 0 0}
+.hero .hero-note a{color:var(--brand);font-weight:600}
 .mascot-stage{display:grid;place-items:center;background:var(--soft);border:2.5px solid var(--ink);border-radius:28px;aspect-ratio:1;max-width:380px;justify-self:center;width:100%;animation:bob 4s ease-in-out infinite}
 .mascot-stage svg{width:78%}
 @keyframes bob{50%{transform:translateY(-8px)}}
@@ -66,6 +68,13 @@ a{color:inherit}
 .es-track{flex:1;height:8px;background:var(--bg);border:1px solid var(--line);border-radius:999px;overflow:hidden}
 .es-fill{height:100%;background:var(--brand);border-radius:999px}
 .es-fill.low{background:var(--soft)}
+
+/* which-AI disclosure (landing) */
+.ai-note{padding:0 0 72px;scroll-margin-top:24px}
+.ai-note .feature-card{padding:26px}
+.ai-note-cols{display:grid;grid-template-columns:1.4fr 1fr;gap:28px}
+.ai-note-cols p{margin-top:12px}
+.ai-note code{font:600 13.5px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:var(--bg);border:1.5px solid var(--line);border-radius:6px;padding:1px 6px}
 
 /* chat */
 .chat-page{display:flex;flex-direction:column;height:100vh;height:100dvh}
@@ -101,6 +110,22 @@ body.dragging .drop{display:grid}
 .streak svg{width:34px;height:34px}
 .streak b{font:800 34px var(--font-head);line-height:1}
 .streak span{font-weight:600}
+.streak-wrap{display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+.btn.checkin{padding:10px 18px;font-size:16px}
+.btn.checkin[disabled]{background:var(--soft);color:var(--muted);opacity:1}
+/* countdown to the next check-in: same border/radius/shadow as .streak, on a card background */
+.timer{display:flex;flex-direction:column;justify-content:center;gap:2px;background:var(--card);color:var(--ink);border:2.5px solid var(--ink);border-radius:16px;padding:8px 18px;box-shadow:4px 4px 0 var(--ink)}
+.timer span{font-size:13px;font-weight:600;color:var(--muted);line-height:1.2}
+.timer b{font:800 24px var(--font-head);line-height:1.1;font-variant-numeric:tabular-nums}
+
+/* results notices: error / example labels (same look as .reasoning) */
+.notice{background:var(--soft);border:2px solid var(--ink);border-left:6px solid var(--brand);border-radius:14px;padding:16px 20px;margin-bottom:20px;display:flex;gap:16px;align-items:center;justify-content:space-between;flex-wrap:wrap}
+.notice.error{border-left-color:#FF7A1A}
+.notice.example{border-left-color:var(--mark)}
+.notice strong{display:block;font-size:15px}
+.notice p{font-size:15px;line-height:1.5}
+.notice .notice-actions{display:flex;gap:12px;flex-wrap:wrap}
+.notice .btn{padding:9px 16px;font-size:15px}
 
 /* view tabs */
 .view-tabs{display:flex;gap:8px;padding:4px;background:var(--soft);border:2px solid var(--ink);border-radius:14px;width:fit-content;margin-bottom:28px}
@@ -197,6 +222,7 @@ body.dragging .drop{display:grid}
   .stat-grid{grid-template-columns:repeat(2,1fr)}
   .chart-grid{grid-template-columns:1fr}
   .feature-card.wide{grid-column:span 1}
+  .ai-note-cols{grid-template-columns:1fr}
 }
 @media(max-width:760px){
   .hero{grid-template-columns:1fr;padding-top:24px}

@@ -1,7 +1,7 @@
 /* ===== Config ===== */
 // Set to false once the Flask backend exposes /api/chat, /api/upload, /api/schedule.
 const USE_MOCK = false;
-const STREAK_DAYS = 5; // placeholder; replace with real data later
+const STREAK_KEY = 'biosync.streak.v1'; // localStorage: { count, last: 'YYYY-MM-DD' }
 const OK_EXT = ["pdf", "doc", "docx", "xls", "xlsx", "png", "jpg", "jpeg", "webp"];
 const MAX_MB = 20;
 
@@ -138,6 +138,19 @@ function deriveSubjectBreakdown(schedule) {
 const MOCK_SUBJECT_BREAKDOWN = deriveSubjectBreakdown(MOCK_SCHEDULE);
 const MOCK_WEEKLY_FOCUS_HOURS = MOCK_SUBJECT_BREAKDOWN.reduce((s, x) => s + x.hours_this_week, 0);
 
+// The "example schedule" view (results.html?example=1, and the labeled fallback
+// shown when the backend reports a failed schedule). Deliberately NOT gated on
+// USE_MOCK: USE_MOCK only decides real-vs-fake API calls; this is static sample
+// data that is always available and always labeled as an example.
+function exampleScheduleData() {
+  return {
+    schedule: MOCK_SCHEDULE,
+    reasoning_notes: MOCK_REASONING,
+    weekly_focus_hours: MOCK_WEEKLY_FOCUS_HOURS,
+    subject_breakdown: MOCK_SUBJECT_BREAKDOWN
+  };
+}
+
 async function fetchSchedule() {
   if (USE_MOCK) {
     await sleep(700);
@@ -150,6 +163,15 @@ async function fetchSchedule() {
   }
   const res = await fetch('/api/schedule');
   if (!res.ok) throw new Error('schedule ' + res.status);
+  // { status: "pending" | "ready" | "failed", schedule, ..., error, reason }
+  return await res.json();
+}
+
+// Re-runs schedule generation after a failure (e.g. rate limit). Same response shape as fetchSchedule().
+async function retrySchedule() {
+  if (USE_MOCK) return fetchSchedule();
+  const res = await fetch('/api/schedule/retry', { method: 'POST' });
+  if (!res.ok) throw new Error('schedule retry ' + res.status);
   return await res.json();
 }
 
@@ -229,7 +251,7 @@ function initChat() {
         typing.remove();
         addMsg('ai', r.status === 'received'
           ? `Got ${file.name}. I'll use it when building your schedule.`
-          : `I couldn't read ${file.name}. Try a PDF, Word, Excel, or image file.`);
+          : `I couldn't read ${file.name}. ${r.error ? String(r.error).slice(0, 200) : 'Try a PDF, Word, Excel, or image file.'}`);
       } catch (e) {
         typing.remove();
         addMsg('ai', `Upload of ${file.name} failed. Try again in a moment.`);
@@ -468,79 +490,237 @@ function renderWeek(container, schedule) {
   });
 }
 
+/* ===== Streak + daily check-in =====
+   Persistence: localStorage (one entry per browser) — fits the app's current
+   no-database, cookie-session setup; the backend has no user identity to key a
+   streak to, so a server endpoint would just be a second source of truth.
+   Day boundary: local midnight, so "once a day" and "next eligible check-in"
+   are the same calendar-day rule. The countdown is recomputed from the clock
+   on every tick (never a decremented counter), so refresh / sleeping tabs /
+   crossing midnight all stay correct. */
+let streakMemory = { count: 0, last: null }; // used only if localStorage is blocked
+const pad2 = n => String(n).padStart(2, '0');
+const dayKey = d => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+
+function readStreak() {
+  try {
+    const o = JSON.parse(localStorage.getItem(STREAK_KEY) || 'null');
+    if (o && Number.isInteger(o.count) && o.count >= 0 && /^\d{4}-\d{2}-\d{2}$/.test(o.last || '')) {
+      streakMemory = { count: o.count, last: o.last };
+    }
+  } catch (e) { /* storage unavailable or corrupt — keep the in-memory value */ }
+  return streakMemory;
+}
+function writeStreak(s) {
+  streakMemory = s;
+  try { localStorage.setItem(STREAK_KEY, JSON.stringify(s)); } catch (e) { /* in-memory only for this page load */ }
+}
+// A streak survives only if the last check-in was today or yesterday; otherwise it has lapsed to 0.
+function streakStatus(now = new Date()) {
+  const s = readStreak();
+  const today = dayKey(now);
+  const yesterday = dayKey(new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1));
+  const checkedInToday = s.last === today;
+  const alive = checkedInToday || s.last === yesterday;
+  return { count: alive ? s.count : 0, checkedInToday, today };
+}
+function checkInToday() {
+  const st = streakStatus();
+  if (!st.checkedInToday) writeStreak({ count: st.count + 1, last: st.today });
+}
+function msUntilNextMidnight(now = new Date()) {
+  return new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1) - now;
+}
+function formatCountdown(ms) {
+  const total = Math.max(0, Math.ceil(ms / 1000));
+  return `${pad2(Math.floor(total / 3600))}:${pad2(Math.floor((total % 3600) / 60))}:${pad2(total % 60)}`;
+}
+
+function initStreak() {
+  const streakEl = $('streak'), btn = $('checkin'), timerEl = $('timer');
+  if (!streakEl || !btn || !timerEl) return;
+  let shown = null; // signature of what is currently rendered; full re-render only when it changes
+
+  function render() {
+    const st = streakStatus();
+    const sig = `${st.count}|${st.checkedInToday}|${st.today}`;
+    if (sig !== shown) { // first render, a check-in, or the day rolled over
+      shown = sig;
+      streakEl.innerHTML = `${ICON.flame}<div><b>${st.count}</b> <span>day streak</span></div>`;
+      btn.disabled = st.checkedInToday;
+      btn.textContent = st.checkedInToday ? 'Checked in today ✓' : 'Check in today';
+      timerEl.innerHTML = st.checkedInToday
+        ? '<span>Next check-in in</span><b></b>'
+        : '<span>Today’s check-in</span><b>Open</b>';
+    }
+    if (st.checkedInToday) timerEl.querySelector('b').textContent = formatCountdown(msUntilNextMidnight());
+  }
+
+  btn.addEventListener('click', () => { checkInToday(); render(); });
+  render();
+  setInterval(render, 1000);
+  document.addEventListener('visibilitychange', render); // catch up immediately after a sleeping tab wakes
+  window.addEventListener('storage', render);            // check-in made in another tab
+}
+
 /* ===== Results page ===== */
+const FAILURE_FALLBACK_MSG = {
+  rate_limited: 'The AI service hit its rate limit — try again shortly.'
+};
+
+function setResultsHeading(isExample) {
+  $('resultsTitle').textContent = isExample ? 'Example week' : 'Your week';
+  $('resultsSub').textContent = isExample
+    ? 'Sample data showing what BioSync builds. This is not your schedule.'
+    : 'Built from your classes, deadlines, and routine.';
+  document.title = isExample ? 'Example schedule – BioSync' : 'Your schedule – BioSync';
+}
+
+function makeNotice(kind, title, text, actions) {
+  const box = document.createElement('div');
+  box.className = 'notice ' + kind;
+  box.setAttribute('role', kind === 'error' ? 'alert' : 'note');
+  const copy = document.createElement('div');
+  const strong = document.createElement('strong'); strong.textContent = title;
+  const p = document.createElement('p'); p.textContent = text;
+  copy.append(strong, p);
+  box.append(copy);
+  if (actions && actions.length) {
+    const wrap = document.createElement('div');
+    wrap.className = 'notice-actions';
+    wrap.append(...actions);
+    box.append(wrap);
+  }
+  return box;
+}
+
+// Renders the weekly view + analytics for one schedule payload into `body`.
+// Used for real schedules AND for the example data — one code path, so the
+// example always looks exactly like a real result.
+function renderScheduleView(body, data) {
+  const schedule = Array.isArray(data) ? data : (data.schedule || []); // tolerate old bare-array shape too
+  const reasoningNotes = Array.isArray(data) ? '' : (data.reasoning_notes || '');
+  const subjectBreakdown = Array.isArray(data) ? [] : (data.subject_breakdown || []);
+  const weeklyFocusHours = Array.isArray(data) ? null : data.weekly_focus_hours;
+
+  const stats = computeStats(schedule, subjectBreakdown, weeklyFocusHours);
+
+  body.innerHTML = `
+    <div class="reasoning" id="reasoningBox"></div>
+    <div class="view-tabs" role="tablist">
+      <button type="button" class="active" data-view="week" role="tab" aria-selected="true">Weekly view</button>
+      <button type="button" data-view="analytics" role="tab" aria-selected="false">Analytics</button>
+    </div>
+    <div class="view-panel active" id="panel-week">
+      <div class="week" id="week"></div>
+    </div>
+    <div class="view-panel" id="panel-analytics">
+      <div class="stat-grid" id="statGrid"></div>
+      <div class="chart-grid">
+        <div class="chart-card">
+          <h3>Hours per subject</h3>
+          <div class="chart-sub">Total deep-focus time scheduled this week</div>
+          <div id="subjectBars"></div>
+        </div>
+        <div class="chart-card">
+          <h3>How your time breaks down</h3>
+          <div class="chart-sub">Focus vs. class, meals, and breaks</div>
+          <div class="donut-wrap">
+            <div id="typeDonut"></div>
+            <div class="legend" id="typeLegend"></div>
+          </div>
+        </div>
+      </div>
+      <div class="heatmap-card">
+        <h3>Energy map across your week</h3>
+        <div class="chart-sub">Where high-, medium-, and low-energy blocks are scheduled, by time of day</div>
+        <div class="heatmap" id="heatmap"></div>
+        <div class="heatmap-legend">
+          <span><span class="hm-cell e-high" style="width:12px;height:12px;display:inline-block"></span> High energy</span>
+          <span><span class="hm-cell e-medium" style="width:12px;height:12px;display:inline-block"></span> Medium energy</span>
+          <span><span class="hm-cell e-low" style="width:12px;height:12px;display:inline-block"></span> Low energy</span>
+          <span><span class="hm-cell e-none" style="width:12px;height:12px;display:inline-block"></span> Nothing scheduled</span>
+        </div>
+      </div>
+    </div>`;
+
+  renderReasoning($('reasoningBox'), reasoningNotes);
+  renderWeek($('week'), schedule);
+  renderStats($('statGrid'), stats);
+  renderSubjectBars($('subjectBars'), stats.subjects);
+  renderTypeDonut($('typeDonut'), $('typeLegend'), schedule);
+  renderHeatmap($('heatmap'), schedule);
+
+  body.querySelectorAll('.view-tabs button').forEach(btn => {
+    btn.addEventListener('click', () => {
+      body.querySelectorAll('.view-tabs button').forEach(b => { b.classList.remove('active'); b.setAttribute('aria-selected', 'false'); });
+      btn.classList.add('active'); btn.setAttribute('aria-selected', 'true');
+      body.querySelectorAll('.view-panel').forEach(p => p.classList.remove('active'));
+      $('panel-' + btn.dataset.view).classList.add('active');
+    });
+  });
+}
+
+// Example view: results.html?example=1. Checked before any API call and independent of USE_MOCK.
+function showExample() {
+  setResultsHeading(true);
+  const build = document.createElement('a');
+  build.className = 'btn'; build.href = 'chat.html'; build.textContent = 'Build my own';
+  $('resultsNotice').replaceChildren(makeNotice(
+    'example', 'This is an example',
+    'Sample data, not based on your answers. No AI call was made to produce it.', [build]
+  ));
+  renderScheduleView($('resultsBody'), exampleScheduleData());
+}
+
+// Backend said the pipeline ran and produced no schedule (rate limit, LLM error, ...).
+// Show the real reason, a retry, and the labeled example — never the example as if it were theirs.
+function showScheduleFailure(data) {
+  setResultsHeading(true);
+  const retry = document.createElement('button');
+  retry.type = 'button'; retry.className = 'btn'; retry.textContent = 'Try again';
+  const errorNotice = makeNotice(
+    'error', "Couldn't build your schedule",
+    data.error || FAILURE_FALLBACK_MSG[data.reason] || "The AI service couldn't build your schedule — try again shortly.",
+    [retry]
+  );
+  retry.addEventListener('click', async () => {
+    retry.disabled = true; retry.textContent = 'Trying again…';
+    try {
+      showResults(await retrySchedule());
+    } catch (e) {
+      retry.disabled = false; retry.textContent = 'Try again';
+      errorNotice.querySelector('p').textContent = "Couldn't reach the server. Check your connection and try again.";
+    }
+  });
+  $('resultsNotice').replaceChildren(
+    errorNotice,
+    makeNotice('example', 'Example schedule below', "Sample data, not your schedule — it shows what BioSync builds once the AI service is available.", [])
+  );
+  renderScheduleView($('resultsBody'), exampleScheduleData());
+}
+
+// Decides what to show for one /api/schedule payload: real schedule, "none yet", or a failure.
+function showResults(data) {
+  $('resultsNotice').replaceChildren();
+  setResultsHeading(false);
+
+  if (!Array.isArray(data) && data.status === 'failed') { showScheduleFailure(data); return; }
+
+  const schedule = Array.isArray(data) ? data : (data.schedule || []);
+  if (!schedule.length) {
+    $('resultsBody').innerHTML = '<p class="state">No schedule yet. <a href="chat.html">Chat with BioSync</a> to build one.</p>';
+    return;
+  }
+  renderScheduleView($('resultsBody'), data);
+}
+
 async function initResults() {
-  $('streak').innerHTML = `${ICON.flame}<div><b>${STREAK_DAYS}</b> <span>day streak</span></div>`;
+  initStreak();
+  if (new URLSearchParams(location.search).get('example') === '1') { showExample(); return; }
 
   try {
-    const data = await fetchSchedule();
-    const schedule = Array.isArray(data) ? data : (data.schedule || []); // tolerate old bare-array shape too
-    const reasoningNotes = Array.isArray(data) ? '' : (data.reasoning_notes || '');
-    const subjectBreakdown = Array.isArray(data) ? [] : (data.subject_breakdown || []);
-    const weeklyFocusHours = Array.isArray(data) ? null : data.weekly_focus_hours;
-
-    const body = $('resultsBody');
-    if (!schedule.length) {
-      body.innerHTML = '<p class="state">No schedule yet. <a href="chat.html">Chat with BioSync</a> to build one.</p>';
-      return;
-    }
-
-    const stats = computeStats(schedule, subjectBreakdown, weeklyFocusHours);
-
-    body.innerHTML = `
-      <div class="reasoning" id="reasoningBox"></div>
-      <div class="view-tabs" role="tablist">
-        <button type="button" class="active" data-view="week" role="tab" aria-selected="true">Weekly view</button>
-        <button type="button" data-view="analytics" role="tab" aria-selected="false">Analytics</button>
-      </div>
-      <div class="view-panel active" id="panel-week">
-        <div class="week" id="week"></div>
-      </div>
-      <div class="view-panel" id="panel-analytics">
-        <div class="stat-grid" id="statGrid"></div>
-        <div class="chart-grid">
-          <div class="chart-card">
-            <h3>Hours per subject</h3>
-            <div class="chart-sub">Total deep-focus time scheduled this week</div>
-            <div id="subjectBars"></div>
-          </div>
-          <div class="chart-card">
-            <h3>How your time breaks down</h3>
-            <div class="chart-sub">Focus vs. class, meals, and breaks</div>
-            <div class="donut-wrap">
-              <div id="typeDonut"></div>
-              <div class="legend" id="typeLegend"></div>
-            </div>
-          </div>
-        </div>
-        <div class="heatmap-card">
-          <h3>Energy map across your week</h3>
-          <div class="chart-sub">Where high-, medium-, and low-energy blocks are scheduled, by time of day</div>
-          <div class="heatmap" id="heatmap"></div>
-          <div class="heatmap-legend">
-            <span><span class="hm-cell e-high" style="width:12px;height:12px;display:inline-block"></span> High energy</span>
-            <span><span class="hm-cell e-medium" style="width:12px;height:12px;display:inline-block"></span> Medium energy</span>
-            <span><span class="hm-cell e-low" style="width:12px;height:12px;display:inline-block"></span> Low energy</span>
-            <span><span class="hm-cell e-none" style="width:12px;height:12px;display:inline-block"></span> Nothing scheduled</span>
-          </div>
-        </div>
-      </div>`;
-
-    renderReasoning($('reasoningBox'), reasoningNotes);
-    renderWeek($('week'), schedule);
-    renderStats($('statGrid'), stats);
-    renderSubjectBars($('subjectBars'), stats.subjects);
-    renderTypeDonut($('typeDonut'), $('typeLegend'), schedule);
-    renderHeatmap($('heatmap'), schedule);
-
-    body.querySelectorAll('.view-tabs button').forEach(btn => {
-      btn.addEventListener('click', () => {
-        body.querySelectorAll('.view-tabs button').forEach(b => { b.classList.remove('active'); b.setAttribute('aria-selected', 'false'); });
-        btn.classList.add('active'); btn.setAttribute('aria-selected', 'true');
-        body.querySelectorAll('.view-panel').forEach(p => p.classList.remove('active'));
-        $('panel-' + btn.dataset.view).classList.add('active');
-      });
-    });
+    showResults(await fetchSchedule());
   } catch (e) {
     $('resultsBody').innerHTML = "<p class='state'>We couldn't load your schedule. Refresh the page to try again.</p>";
   }

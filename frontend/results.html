@@ -20,11 +20,17 @@
 
   <header class="results-head">
     <div>
-      <h1>Your week</h1>
-      <p>Built from your classes, deadlines, and routine.</p>
+      <h1 id="resultsTitle">Your week</h1>
+      <p id="resultsSub">Built from your classes, deadlines, and routine.</p>
     </div>
-    <div class="streak" id="streak"></div>
+    <div class="streak-wrap">
+      <div class="streak" id="streak"></div>
+      <button type="button" class="btn checkin" id="checkin">Check in today</button>
+      <div class="timer" id="timer" role="timer"></div>
+    </div>
   </header>
+
+  <div id="resultsNotice"></div>
 
   <div id="resultsBody">
     <div class="skeleton" style="margin-bottom:28px"></div>
