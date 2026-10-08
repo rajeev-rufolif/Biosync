@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: biosync
+    runtime: docker
+    rootDir: backend
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: FLASK_SECRET_KEY
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: DEFAULT_LLM_PROVIDER
+        value: groq

@@ -1,0 +1,10 @@
+flask
+python-dotenv
+anthropic
+groq
+pdfplumber
+python-docx
+openpyxl
+pytesseract
+Pillow
+werkzeug
