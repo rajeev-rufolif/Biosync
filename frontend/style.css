@@ -125,18 +125,18 @@ select:focus-visible,.byok input:focus-visible,.composer textarea:focus-visible{
 .view-panel{display:none;margin-top:24px}
 .view-panel.active{display:block}
 
-.week{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,330px),1fr));gap:16px;padding-bottom:64px}
+.week{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,380px),1fr));gap:28px;padding-bottom:64px}
 .day{display:flex;flex-direction:column;overflow:hidden;border:1px solid var(--border);border-radius:var(--r-lg);background:linear-gradient(180deg,var(--surface-2),var(--surface-1) 55%);box-shadow:inset 0 1px 0 rgba(255,255,255,.05);transition:transform .3s var(--ease),border-color .3s}
 .day:hover{transform:translateY(-3px);border-color:var(--border-strong)}
 .day.today{border-color:rgba(45,226,166,.55);box-shadow:inset 0 1px 0 rgba(255,255,255,.07),0 0 60px -24px rgba(45,226,166,.6)}
-.day header{display:flex;align-items:baseline;justify-content:space-between;gap:12px;padding:20px 22px 0}
+.day header{display:flex;align-items:baseline;justify-content:space-between;gap:12px;padding:26px 26px 0}
 .day h3{font:400 1.875rem/1.25 var(--serif);letter-spacing:-.01em}
 .day small{color:var(--text-3);font:500 .75rem var(--mono);letter-spacing:.08em;text-transform:uppercase}
 .day.today small{padding:3px 10px;border-radius:999px;background:var(--accent);color:var(--bg-0)}
-.focus-summary{padding:8px 22px 16px;border-bottom:1px solid var(--border);color:var(--text-2);font-size:.9375rem;line-height:1.5}
+.focus-summary{padding:12px 26px 20px;border-bottom:1px solid var(--border);color:var(--text-2);font-size:.9375rem;line-height:1.55}
 .day table,.day tbody{display:block}
-.day tbody{padding:6px 22px 14px}
-.day tr{display:grid;grid-template-columns:92px 1fr;gap:12px;padding:13px 0;border-top:1px dashed var(--border)}
+.day tbody{padding:8px 26px 20px}
+.day tr{display:grid;grid-template-columns:92px 1fr;gap:12px;padding:18px 0;border-top:1px dashed var(--border)}
 .day tr:first-child{border-top:0}
 .day td{display:block}
 .time{padding-top:3px;color:var(--text-2);font:500 .8125rem var(--mono);font-variant-numeric:tabular-nums}
