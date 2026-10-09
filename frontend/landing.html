@@ -101,7 +101,11 @@
         </div>
         <div>
           <span class="chip">Alternate · Claude (Anthropic)</span>
-          <p>Claude is supported as an alternate provider for deployments that configure an <code>ANTHROPIC_API_KEY</code>. Unless a deployment has been switched over, you're on Groq.</p>
+          <p>Claude is supported as an alternate provider for deployments that configure an <code>ANTHROPIC_API_KEY</code>, or per-session via the chat page's "Use my own AI API key" control. Unless switched over, you're on Groq.</p>
+        </div>
+        <div>
+          <span class="chip">Alternate · Gemini (Google AI)</span>
+          <p>Gemini is also supported as an alternate provider — same deal, via <code>GEMINI_API_KEY</code> or the chat page's own key option. Its free tier allows far more tokens per minute than Groq's, which is why it's worth trying if a schedule keeps failing to generate. Note: a consumer Gemini app subscription is not an API key and can't be used here — you'd need a free key from <a href="https://aistudio.google.com" target="_blank" rel="noopener">Google AI Studio</a>.</p>
         </div>
       </div>
     </div>

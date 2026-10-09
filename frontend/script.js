@@ -2,7 +2,12 @@
 // Set to false once the Flask backend exposes /api/chat, /api/upload, /api/schedule.
 const USE_MOCK = false;
 const STREAK_KEY = 'biosync.streak.v1'; // localStorage: { count, last: 'YYYY-MM-DD' }
-const BYOK_KEY = 'biosync.byok.anthropic.v1'; // sessionStorage (Task 8 — NOT localStorage, on purpose): { enabled, key }
+// sessionStorage (Task 8/8b — NOT localStorage, on purpose): { provider: 'none'|'claude'|'gemini', keys: { claude: '', gemini: '' } }
+// Replaces the old v1 key (single Claude-only { enabled, key } shape) — a provider
+// field supports either BYO provider without a second storage key to keep in sync,
+// and keeping both providers' typed-in keys (not just the active one) means
+// switching the dropdown back and forth doesn't lose what was pasted.
+const BYOK_KEY = 'biosync.byok.v2';
 const OK_EXT = ["pdf", "doc", "docx", "xls", "xlsx", "png", "jpg", "jpeg", "webp"];
 const MAX_MB = 20;
 
@@ -35,32 +40,39 @@ function mascot() {
 }
 document.querySelectorAll('[data-mascot]').forEach(el => el.innerHTML = mascot());
 
-/* ===== BYO Claude key (Task 8) =====
+/* ===== BYO API key: Claude or Gemini (Task 8 / 8b) =====
    Lives here (not inside initChat) because retrySchedule() on results.html also
    needs to send it — sessionStorage is shared across pages of the same tab, so
-   this works even though the toggle/input only exist in chat.html's DOM. Storage
-   is a single JSON object (enabled + key together) specifically so results.html
-   can tell "opted in" from "opted out" without needing chat.html's checkbox. */
+   this works even though the dropdown/inputs only exist in chat.html's DOM.
+   Storage is one JSON object { provider, keys: { claude, gemini } } so
+   results.html can tell which provider (if any) is active, and what key to
+   send for it, without needing chat.html's dropdown DOM. */
 function readByok() {
   try {
     const o = JSON.parse(sessionStorage.getItem(BYOK_KEY) || 'null');
-    if (o && typeof o.enabled === 'boolean' && typeof o.key === 'string') return o;
+    if (o && typeof o.provider === 'string' && o.keys &&
+        typeof o.keys.claude === 'string' && typeof o.keys.gemini === 'string') return o;
   } catch (e) { /* storage unavailable or corrupt — treat as opted out */ }
-  return { enabled: false, key: '' };
+  return { provider: 'none', keys: { claude: '', gemini: '' } };
 }
 function writeByok(o) {
   try { sessionStorage.setItem(BYOK_KEY, JSON.stringify(o)); } catch (e) { /* in-memory only for this page load */ }
 }
-// Only returns a key when the user has actually opted in AND pasted something —
-// never inferred from storage alone, so a key left over from an unchecked toggle
-// is never silently sent.
+// Only returns a key when the user has actually selected that provider AND
+// pasted something for it — never inferred from storage alone, so a key left
+// over from switching the dropdown away is never silently sent.
 function getUserApiKey() {
   const o = readByok();
-  return (o.enabled && o.key.trim()) ? o.key.trim() : null;
+  const key = o.keys[o.provider];
+  return (o.provider !== 'none' && key && key.trim()) ? key.trim() : null;
 }
 function authHeaders() {
+  const o = readByok();
   const key = getUserApiKey();
-  return key ? { 'X-Anthropic-Api-Key': key } : {};
+  if (!key) return {};
+  if (o.provider === 'claude') return { 'X-Anthropic-Api-Key': key };
+  if (o.provider === 'gemini') return { 'X-Gemini-Api-Key': key };
+  return {};
 }
 
 /* ===== API (mocked until backend exists) ===== */
@@ -231,23 +243,39 @@ function initEffortSelector() {
   });
 }
 
-/* ===== Chat page: BYO Claude key opt-in (Task 8) ===== */
+/* ===== Chat page: BYO API key opt-in — Claude or Gemini (Task 8 / 8b) ===== */
 // Pre-fills from sessionStorage so a mid-chat page refresh doesn't force a
-// re-paste; writing happens on every toggle/input change.
+// re-paste; writing happens on every select/input change. Only one provider
+// panel is shown at a time, matching the select's current value — both
+// providers' typed keys are kept in storage regardless of which is active,
+// so switching the dropdown back and forth doesn't lose either paste.
 function initByok() {
-  const toggle = $('byokToggle'), panel = $('byokPanel'), input = $('byokInput');
-  if (!toggle || !panel || !input) return;
+  const select = $('byokProvider');
+  const panels = { claude: $('byokPanel-claude'), gemini: $('byokPanel-gemini') };
+  const inputs = { claude: $('byokInput-claude'), gemini: $('byokInput-gemini') };
+  if (!select || !panels.claude || !panels.gemini || !inputs.claude || !inputs.gemini) return;
+
   const saved = readByok();
-  toggle.checked = saved.enabled;
-  input.value = saved.key;
-  panel.hidden = !saved.enabled;
+  select.value = saved.provider;
+  inputs.claude.value = saved.keys.claude;
+  inputs.gemini.value = saved.keys.gemini;
+
+  function showActivePanel() {
+    panels.claude.hidden = select.value !== 'claude';
+    panels.gemini.hidden = select.value !== 'gemini';
+  }
+  showActivePanel();
 
   function sync() {
-    writeByok({ enabled: toggle.checked, key: input.value });
-    panel.hidden = !toggle.checked;
+    writeByok({
+      provider: select.value,
+      keys: { claude: inputs.claude.value, gemini: inputs.gemini.value }
+    });
+    showActivePanel();
   }
-  toggle.addEventListener('change', sync);
-  input.addEventListener('input', sync);
+  select.addEventListener('change', sync);
+  inputs.claude.addEventListener('input', sync);
+  inputs.gemini.addEventListener('input', sync);
 }
 
 /* ===== Chat page ===== */
