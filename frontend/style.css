@@ -97,6 +97,20 @@ a{color:inherit}
 .composer textarea{flex:1;resize:none;font:inherit;color:var(--ink);background:var(--bg);border:2px solid var(--line);border-radius:12px;padding:12px 14px;max-height:140px}
 .composer textarea:focus{outline:none;border-color:var(--brand)}
 .composer textarea:disabled{opacity:.6;cursor:not-allowed}
+/* chat settings bar: effort selector (Task 7) + BYO Claude key (Task 8) */
+.settings-bar{display:flex;flex-wrap:wrap;gap:18px 28px;align-items:flex-start;justify-content:space-between;padding:14px 20px;border-bottom:2px solid var(--line);background:var(--bg)}
+.settings-label{display:block;font-size:12px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.03em;margin-bottom:6px}
+.effort-select{flex:none}
+.effort-select .view-tabs{margin-bottom:0}
+.byok{flex:1;min-width:240px;max-width:460px}
+.byok-toggle{display:flex;align-items:center;gap:8px;font-size:14px;font-weight:600;cursor:pointer}
+.byok-toggle input{width:16px;height:16px;accent-color:var(--brand)}
+.byok-panel{margin-top:10px;display:flex;flex-direction:column;gap:8px}
+.byok-panel input[type=password]{font:inherit;width:100%;padding:10px 12px;border:2px solid var(--line);border-radius:10px;background:var(--card);color:var(--ink)}
+.byok-panel input[type=password]:focus{outline:none;border-color:var(--brand)}
+.byok-warning{font-size:12.5px;color:var(--muted);line-height:1.5;background:var(--soft);border:1.5px solid var(--line);border-radius:10px;padding:10px 12px}
+@media(max-width:760px){.settings-bar{flex-direction:column}.byok{max-width:none}}
+
 .drop{position:fixed;inset:12px;display:none;place-items:center;background:var(--card);background:color-mix(in srgb,var(--card) 92%,transparent);border:3px dashed var(--brand);border-radius:20px;font:700 24px var(--font-head);z-index:10;pointer-events:none}
 body.dragging .drop{display:grid}
 .done-cta{align-self:center;margin-top:8px}

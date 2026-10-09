@@ -21,6 +21,26 @@
 </div>
 
 <main class="chat-panel" id="panel">
+  <div class="settings-bar" id="settingsBar">
+    <div class="effort-select">
+      <span class="settings-label">Schedule detail</span>
+      <div class="view-tabs" role="group" aria-label="Schedule detail level" id="effortTabs">
+        <button type="button" data-effort="low" aria-pressed="false">Low</button>
+        <button type="button" class="active" data-effort="medium" aria-pressed="true">Medium</button>
+        <button type="button" data-effort="high" aria-pressed="false">High</button>
+      </div>
+    </div>
+    <div class="byok">
+      <label class="byok-toggle">
+        <input type="checkbox" id="byokToggle">
+        <span>Use my own Claude API key</span>
+      </label>
+      <div class="byok-panel" id="byokPanel" hidden>
+        <input type="password" id="byokInput" placeholder="sk-ant-…" autocomplete="off" spellcheck="false" aria-label="Your Anthropic API key">
+        <p class="byok-warning">Pasting an API key into any website carries risk — anyone with access to this browser/device, or a malicious browser extension, could potentially read it. Only paste a key you're comfortable rotating. It's kept in this tab only (cleared when you close it) and sent only with your own requests here, never stored on our server beyond the single request it's used for — that protects against our server storing or leaking it, not against every possible risk on your own device.</p>
+      </div>
+    </div>
+  </div>
   <div class="messages" id="messages" aria-live="polite"></div>
   <form class="composer" id="composer">
     <input type="file" id="file" hidden multiple accept=".pdf,.doc,.docx,.xls,.xlsx,.png,.jpg,.jpeg,.webp">

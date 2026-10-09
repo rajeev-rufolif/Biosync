@@ -2,6 +2,7 @@
 // Set to false once the Flask backend exposes /api/chat, /api/upload, /api/schedule.
 const USE_MOCK = false;
 const STREAK_KEY = 'biosync.streak.v1'; // localStorage: { count, last: 'YYYY-MM-DD' }
+const BYOK_KEY = 'biosync.byok.anthropic.v1'; // sessionStorage (Task 8 — NOT localStorage, on purpose): { enabled, key }
 const OK_EXT = ["pdf", "doc", "docx", "xls", "xlsx", "png", "jpg", "jpeg", "webp"];
 const MAX_MB = 20;
 
@@ -34,6 +35,34 @@ function mascot() {
 }
 document.querySelectorAll('[data-mascot]').forEach(el => el.innerHTML = mascot());
 
+/* ===== BYO Claude key (Task 8) =====
+   Lives here (not inside initChat) because retrySchedule() on results.html also
+   needs to send it — sessionStorage is shared across pages of the same tab, so
+   this works even though the toggle/input only exist in chat.html's DOM. Storage
+   is a single JSON object (enabled + key together) specifically so results.html
+   can tell "opted in" from "opted out" without needing chat.html's checkbox. */
+function readByok() {
+  try {
+    const o = JSON.parse(sessionStorage.getItem(BYOK_KEY) || 'null');
+    if (o && typeof o.enabled === 'boolean' && typeof o.key === 'string') return o;
+  } catch (e) { /* storage unavailable or corrupt — treat as opted out */ }
+  return { enabled: false, key: '' };
+}
+function writeByok(o) {
+  try { sessionStorage.setItem(BYOK_KEY, JSON.stringify(o)); } catch (e) { /* in-memory only for this page load */ }
+}
+// Only returns a key when the user has actually opted in AND pasted something —
+// never inferred from storage alone, so a key left over from an unchecked toggle
+// is never silently sent.
+function getUserApiKey() {
+  const o = readByok();
+  return (o.enabled && o.key.trim()) ? o.key.trim() : null;
+}
+function authHeaders() {
+  const key = getUserApiKey();
+  return key ? { 'X-Anthropic-Api-Key': key } : {};
+}
+
 /* ===== API (mocked until backend exists) ===== */
 const GREETING = "Hi! I'm BioSync. Let's build your week. What courses are you taking this term?";
 const MOCK_REPLIES = [
@@ -54,7 +83,7 @@ async function sendMessage(text) {
   }
   const res = await fetch('/api/chat', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
     body: JSON.stringify({ message: text })
   });
   if (!res.ok) throw new Error('chat ' + res.status);
@@ -170,9 +199,55 @@ async function fetchSchedule() {
 // Re-runs schedule generation after a failure (e.g. rate limit). Same response shape as fetchSchedule().
 async function retrySchedule() {
   if (USE_MOCK) return fetchSchedule();
-  const res = await fetch('/api/schedule/retry', { method: 'POST' });
+  const res = await fetch('/api/schedule/retry', { method: 'POST', headers: authHeaders() });
   if (!res.ok) throw new Error('schedule retry ' + res.status);
   return await res.json();
+}
+
+/* ===== Chat page: effort selector (Task 7) ===== */
+// Lives before/alongside the checklist (visible for the whole chat, not a
+// checklist question) so it can be changed any time before the pipeline runs.
+// Server already defaults new sessions to "medium", so this only needs to POST
+// on an actual change — no need to sync a value on page load.
+function setEffort(level, group) {
+  (group || $('effortTabs'))?.querySelectorAll('button').forEach(b => {
+    const active = b.dataset.effort === level;
+    b.classList.toggle('active', active);
+    b.setAttribute('aria-pressed', String(active));
+  });
+  if (!USE_MOCK) {
+    fetch('/api/effort', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ level })
+    }).catch(() => { /* best-effort — server falls back to "medium" if this never lands */ });
+  }
+}
+function initEffortSelector() {
+  const group = $('effortTabs');
+  if (!group) return;
+  group.querySelectorAll('button').forEach(b => {
+    b.addEventListener('click', () => setEffort(b.dataset.effort, group));
+  });
+}
+
+/* ===== Chat page: BYO Claude key opt-in (Task 8) ===== */
+// Pre-fills from sessionStorage so a mid-chat page refresh doesn't force a
+// re-paste; writing happens on every toggle/input change.
+function initByok() {
+  const toggle = $('byokToggle'), panel = $('byokPanel'), input = $('byokInput');
+  if (!toggle || !panel || !input) return;
+  const saved = readByok();
+  toggle.checked = saved.enabled;
+  input.value = saved.key;
+  panel.hidden = !saved.enabled;
+
+  function sync() {
+    writeByok({ enabled: toggle.checked, key: input.value });
+    panel.hidden = !toggle.checked;
+  }
+  toggle.addEventListener('change', sync);
+  input.addEventListener('input', sync);
 }
 
 /* ===== Chat page ===== */
@@ -180,6 +255,8 @@ function initChat() {
   const box = $('messages'), input = $('input'), sendBtn = $('send');
   $('attach').innerHTML = ICON.clip;
   sendBtn.innerHTML = ICON.send;
+  initEffortSelector();
+  initByok();
   let busy = false, finished = false;
 
   const scroll = () => box.scrollTo({ top: box.scrollHeight, behavior: 'smooth' });
