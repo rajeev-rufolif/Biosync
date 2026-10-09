@@ -56,12 +56,13 @@ a{color:inherit}
 .hero::before{content:"";position:absolute;inset:-12% -8% auto auto;z-index:-1;width:68%;height:92%;pointer-events:none;background:radial-gradient(closest-side,rgba(45,226,166,.2),transparent);filter:blur(24px)}
 .badge{display:inline-flex;align-items:center;gap:10px;min-height:32px;padding:0 14px;border:1px solid var(--border-strong);border-radius:999px;background:rgba(255,255,255,.04);color:var(--text-2);font:500 .8125rem var(--mono)}
 .badge__dot{width:7px;height:7px;border-radius:50%;background:var(--accent);box-shadow:0 0 0 4px rgba(45,226,166,.18)}
-h1{margin:26px 0 24px;font:400 clamp(2.6rem,1.4rem + 5vw,5.25rem)/1.22 var(--serif);letter-spacing:-.025em;text-wrap:balance}
+.hero__copy{max-width:52ch}
+h1{max-width:14ch;margin:24px 0 28px;font:400 clamp(2.4rem,1.6rem + 3.4vw,4.25rem)/1.22 var(--serif);letter-spacing:-.02em;text-wrap:balance}
 h1 em{color:var(--accent);font-style:italic}
 @supports ((-webkit-background-clip:text) or (background-clip:text)){
   h1 em{background:linear-gradient(95deg,var(--accent),var(--accent-2));-webkit-background-clip:text;background-clip:text;color:transparent}
 }
-.lede{max-width:46ch;color:var(--text-2);font-size:clamp(1.0625rem,1rem + .4vw,1.25rem);text-wrap:pretty}
+.lede{max-width:44ch;margin-top:4px;color:var(--text-2);font-size:clamp(1.0625rem,1rem + .4vw,1.1875rem);line-height:1.7;text-wrap:pretty}
 .actions{display:flex;flex-wrap:wrap;gap:12px;margin-top:32px}
 .actions--center{justify-content:center}
 .proof{display:flex;flex-wrap:wrap;gap:8px 22px;margin-top:30px;padding:0;list-style:none;color:var(--text-2);font:400 .8125rem var(--mono)}
