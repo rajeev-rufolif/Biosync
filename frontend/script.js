@@ -18,7 +18,7 @@ const $ = id => document.getElementById(id);
 const ICON = {
   send: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2 11 13M22 2l-7 20-4-9-9-4z"/></svg>',
   clip: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="m21 11-9 9a6 6 0 0 1-8.5-8.5l9-9a4 4 0 0 1 5.7 5.7l-9 9a2 2 0 0 1-2.8-2.8l8.3-8.3"/></svg>',
-  flame: '<svg viewBox="0 0 24 24"><path d="M12 2c1 4 5 6 5 11a5 5 0 0 1-10 0c0-2 1-3 2-4 0 2 1 3 2 3-1-4 0-7 1-10z" fill="#FF7A1A" stroke="#1B2340" stroke-width="1.6" stroke-linejoin="round"/></svg>',
+  flame: '<svg viewBox="0 0 24 24"><path d="M12 2c1 4 5 6 5 11a5 5 0 0 1-10 0c0-2 1-3 2-4 0 2 1 3 2 3-1-4 0-7 1-10z" fill="#F4C95D" stroke="#F4C95D" stroke-width="1.2" stroke-linejoin="round"/></svg>',
   bulb: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 15a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3z"/><path d="M19 11a7 7 0 0 1-14 0M12 18v4"/></svg>',
   clock: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>',
   book: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>',
@@ -26,17 +26,7 @@ const ICON = {
   calendar: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/></svg>'
 };
 function mascot() {
-  return `<svg viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg">
-    <g stroke="#1B2340" stroke-width="5" stroke-linecap="round">
-      <circle cx="58" cy="32" r="16" fill="#FFE066"/><circle cx="142" cy="32" r="16" fill="#FFE066"/>
-      <ellipse cx="80" cy="176" rx="12" ry="8" fill="#FFE066"/><ellipse cx="120" cy="176" rx="12" ry="8" fill="#FFE066"/>
-      <circle cx="100" cy="104" r="68" fill="#fff"/>
-      <path d="M100 44v8M100 156v8M40 104h8M152 104h8" fill="none"/>
-      <path d="M76 126q24 20 48 0" fill="none"/>
-    </g>
-    <circle cx="80" cy="96" r="7" fill="#1B2340"/><circle cx="120" cy="96" r="7" fill="#1B2340"/>
-    <circle cx="66" cy="114" r="7" fill="#FFB4A8" opacity=".8"/><circle cx="134" cy="114" r="7" fill="#FFB4A8" opacity=".8"/>
-  </svg>`;
+  return `<svg viewBox="0 0 32 32" aria-hidden="true"><circle cx="16" cy="16" r="14" fill="none" stroke="#2DE2A6" stroke-width="2.2"/><path d="M5 20c4-1 5-9 11-9s6 9 11 9" fill="none" stroke="#F4C95D" stroke-width="2.6" stroke-linecap="round"/></svg>`;
 }
 document.querySelectorAll('[data-mascot]').forEach(el => el.innerHTML = mascot());
 
@@ -285,7 +275,15 @@ function initChat() {
   sendBtn.innerHTML = ICON.send;
   initEffortSelector();
   initByok();
-  let busy = false, finished = false;
+  let busy = false, finished = false, answered = 0;
+  const pBar = $('progressBar'), pText = $('progressText'), pWrap = $('progress');
+  function updateProgress() {
+    if (!pBar) return;
+    const n = Math.min(answered, 7);
+    pBar.style.width = (n / 7 * 100) + '%';
+    pWrap.setAttribute('aria-valuenow', String(n));
+    pText.textContent = n >= 7 ? 'All set' : `Question ${n + 1} of 7`;
+  }
 
   const scroll = () => box.scrollTo({ top: box.scrollHeight, behavior: 'smooth' });
 
@@ -335,7 +333,7 @@ function initChat() {
     try {
       const data = await sendMessage(text);
       typing.remove();
-      addMsg('ai', data.reply);
+      addMsg('ai', data.reply); answered++; updateProgress();
       if (data.done) { finished = true; showDone(); }
     } catch (e) {
       typing.remove();
@@ -395,7 +393,7 @@ function initChat() {
 
 /* ===== Results page: helpers ===== */
 const DAY_ORDER = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'];
-const PALETTE = ['#4B4FE8', '#9A9DF2', '#FFB4A8', '#FFE066', '#6FCF97', '#56B4D3', '#B79CED'];
+const PALETTE = ['#2DE2A6', '#F4C95D', '#5CC8FF', '#B79CED', '#FF8FA3', '#7BE495', '#E6A15C'];
 
 function timeToMinutes(t) {
   if (!t) return null;
@@ -486,7 +484,7 @@ function renderTypeDonut(wrapEl, legendEl, schedule) {
     totals[key] += durationHours(b.time);
   }));
   const labels = { study: 'Deep focus', class: 'Class / lab', meal: 'Meals', break: 'Breaks', other: 'Other' };
-  const colors = { study: '#4B4FE8', class: '#9A9DF2', meal: '#FFB4A8', break: '#6FCF97', other: '#D5DAEA' };
+  const colors = { study: '#2DE2A6', class: '#5CC8FF', meal: '#F4C95D', break: '#B79CED', other: '#5B6866' };
   const entries = Object.entries(totals).filter(([, v]) => v > 0);
   const sum = entries.reduce((s, [, v]) => s + v, 0) || 1;
 

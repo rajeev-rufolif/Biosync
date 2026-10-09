@@ -3,24 +3,32 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="color-scheme" content="light dark">
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='13' fill='%23FFE066' stroke='%231B2340' stroke-width='3'/%3E%3Cpath d='M16 8v8' stroke='%231B2340' stroke-width='3' stroke-linecap='round'/%3E%3C/svg%3E">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#05090A">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='14' fill='%2305090A' stroke='%232DE2A6' stroke-width='2.5'/%3E%3Cpath d='M5 20c4-1 5-9 11-9s6 9 11 9' fill='none' stroke='%23F4C95D' stroke-width='2.5' stroke-linecap='round'/%3E%3C/svg%3E">
 <title>Chat – BioSync</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:wght@600;800&family=DM+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500&family=Instrument+Serif:ital@0;1&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="style.css">
 </head>
 <body data-page="chat" class="chat-page">
 <div class="drop" aria-hidden="true">Drop your file to upload</div>
-<div class="wrap" style="width:100%">
-  <nav class="nav">
-    <a class="logo" href="landing.html"><span class="dot"></span>BioSync</a>
-    <a class="link" href="results.html">My schedule</a>
-  </nav>
-</div>
+<header class="wrap nav">
+  <a class="logo" href="landing.html" aria-label="BioSync home"><svg viewBox="0 0 32 32" width="28" height="28" aria-hidden="true"><circle cx="16" cy="16" r="14" fill="none" stroke="#2DE2A6" stroke-width="2.5"/><path d="M5 20c4-1 5-9 11-9s6 9 11 9" fill="none" stroke="#F4C95D" stroke-width="2.5" stroke-linecap="round"/></svg>BioSync</a>
+  <a class="link" href="results.html">My schedule</a>
+</header>
 
-<main class="chat-panel" id="panel">
+<main class="wrap">
+<section class="chat-panel" id="panel" aria-label="Chat with BioSync">
+  <div class="chat-head">
+    <span class="avatar" data-mascot aria-hidden="true"></span>
+    <div><h1>Build your week</h1><p><span class="status" aria-hidden="true"></span>Seven quick questions, then your schedule</p></div>
+    <span class="step-count" id="progressText">Question 1 of 7</span>
+  </div>
+  <div class="progress" id="progress" role="progressbar" aria-label="Chat progress" aria-valuemin="0" aria-valuemax="7" aria-valuenow="0"><i id="progressBar"></i></div>
+  <details class="settings">
+  <summary>Schedule detail and your own AI key (optional)</summary>
   <div class="settings-bar" id="settingsBar">
     <div class="effort-select">
       <span class="settings-label">Schedule detail</span>
@@ -49,6 +57,7 @@
       </div>
     </div>
   </div>
+  </details>
   <div class="messages" id="messages" aria-live="polite"></div>
   <form class="composer" id="composer">
     <input type="file" id="file" hidden multiple accept=".pdf,.doc,.docx,.xls,.xlsx,.png,.jpg,.jpeg,.webp">
@@ -56,8 +65,10 @@
     <textarea id="input" rows="1" placeholder="Type your message…" aria-label="Message"></textarea>
     <button type="submit" class="btn icon" id="send" aria-label="Send"></button>
   </form>
+</section>
 </main>
 <p class="hint">Drag and drop PDF, Word, Excel, or image files anywhere in the chat.</p>
+<noscript><p class="hint">BioSync needs JavaScript to chat.</p></noscript>
 <script src="script.js"></script>
 </body>
 </html>
