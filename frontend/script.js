@@ -555,42 +555,130 @@ function renderReasoning(container, notes) {
   container.innerHTML = `${ICON.bulb}<p><strong>Why your week looks like this</strong>${notes}</p>`;
 }
 
+const escHtml = s => String(s ?? '').replace(/[<>&"]/g, c => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;' }[c]));
+const abbr3 = d => String(d || '').slice(0, 3);
+const CHEV = p => `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="${p}"/></svg>`;
+
+function toast(msg) {
+  const t = document.createElement('div');
+  t.className = 'toast'; t.setAttribute('role', 'status'); t.textContent = msg;
+  document.body.append(t);
+  setTimeout(() => t.remove(), 2800);
+}
+
+function dayCardHtml(d, isToday) {
+  const blocks = Array.isArray(d.blocks) ? d.blocks : [];
+  const rows = blocks.map(b => {
+    const e = ['high', 'medium', 'low'].includes(b.energy) ? b.energy : '';
+    return `<tr><td class="time">${escHtml(b.time)}</td><td><div class="block-activity">${e ? `<span class="energy-dot ${e}" title="${e} energy"></span>` : ''}<div class="block-main"><b>${escHtml(b.activity)}</b>${b.note ? `<div class="block-note">${escHtml(b.note)}</div>` : ''}</div></div></td></tr>`;
+  }).join('') || '<tr><td class="empty" colspan="2">Nothing planned.</td></tr>';
+  const count = `${blocks.length} ${blocks.length === 1 ? 'block' : 'blocks'}`;
+  return `<header><h3>${escHtml(d.day)}</h3><small>${isToday ? 'Today' : count}</small></header>${d.focus_summary ? `<div class="focus-summary">${escHtml(d.focus_summary)}</div>` : ''}<table><tbody>${rows}</tbody></table>`;
+}
+
+// 3-day carousel: the focused day is crisp, its neighbours sit either side, smaller and faded.
+// Cards are stacked in one grid cell and positioned by data-pos (-2..2), so only transform/opacity animate.
 function renderWeek(container, schedule) {
+  const n = schedule.length;
+  if (!n) { container.className = ''; container.innerHTML = '<p class="state">No days to show yet.</p>'; return; }
   const todayKey = new Date().toLocaleDateString('en-US', { weekday: 'short' }).toLowerCase();
-  container.innerHTML = '';
-  schedule.forEach(d => {
-    const blocks = Array.isArray(d.blocks) ? d.blocks : [];
-    const isToday = String(d.day || '').slice(0, 3).toLowerCase() === todayKey;
-    const card = document.createElement('article');
-    card.className = 'day' + (isToday ? ' today' : '');
-    const head = document.createElement('header');
-    const h = document.createElement('h3'); h.textContent = d.day || '';
-    const n = document.createElement('small');
-    n.textContent = isToday ? 'Today' : `${blocks.length} ${blocks.length === 1 ? 'block' : 'blocks'}`;
-    head.append(h, n);
-    card.append(head);
+  const todayIdx = schedule.findIndex(d => abbr3(d.day).toLowerCase() === todayKey);
+  const focusOf = d => (d.blocks || []).filter(b => b.type === 'study').reduce((s, b) => s + durationHours(b.time), 0);
+  const maxFocus = Math.max(...schedule.map(focusOf), 1);
+  let cur = Math.max(todayIdx, 0), x0 = null, swiped = false;
 
-    if (d.focus_summary) {
-      const fs = document.createElement('div');
-      fs.className = 'focus-summary';
-      fs.textContent = d.focus_summary;
-      card.append(fs);
-    }
+  container.className = 'pager';
+  container.innerHTML = `
+    <button type="button" class="nav-arrow nav-arrow--prev" aria-label="Previous day">${CHEV('m15 18-6-6 6-6')}</button>
+    <div class="stage" tabindex="0" role="group" aria-roledescription="carousel" aria-label="Weekly schedule, one day in focus"></div>
+    <button type="button" class="nav-arrow nav-arrow--next" aria-label="Next day">${CHEV('m9 18 6-6-6-6')}</button>
+    <div class="chips" role="group" aria-label="Jump to a day"></div>
+    <p class="sr-only live" aria-live="polite"></p>`;
+  const q = s => container.querySelector(s);
+  const stage = q('.stage'), chips = q('.chips'), prev = q('.nav-arrow--prev'), next = q('.nav-arrow--next'), live = q('.live');
 
-    const body = document.createElement('tbody');
-    if (!blocks.length) {
-      const td = body.insertRow().insertCell(); td.colSpan = 2; td.className = 'empty'; td.textContent = 'Nothing planned.';
-    }
-    blocks.forEach(b => {
-      const tr = body.insertRow();
-      const t = tr.insertCell(); t.className = 'time'; t.textContent = b.time || '';
-      const a = tr.insertCell();
-      const energyClass = b.energy && ['high', 'medium', 'low'].includes(b.energy) ? b.energy : '';
-      a.innerHTML = `<div class="block-activity">${energyClass ? `<span class="energy-dot ${energyClass}" title="${energyClass} energy"></span>` : ''}<div class="block-main"><b>${(b.activity || '').replace(/[<>&]/g, c => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;' }[c]))}</b>${b.note ? `<div class="block-note">${b.note.replace(/[<>&]/g, c => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;' }[c]))}</div>` : ''}</div></div>`;
-    });
-    const table = document.createElement('table'); table.append(body);
-    card.append(table); container.append(card);
+  const cards = schedule.map((d, i) => {
+    const el = document.createElement('article');
+    el.className = 'day' + (i === todayIdx ? ' today' : '');
+    el.innerHTML = dayCardHtml(d, i === todayIdx);
+    el.addEventListener('click', () => { if (!swiped && i !== cur) go(i); });
+    stage.append(el);
+    return el;
   });
+
+  // Day chips double as a week-at-a-glance: the bar under each day is its focus load.
+  const tabs = schedule.map((d, i) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'chip' + (i === todayIdx ? ' is-today' : '');
+    b.title = `${d.day}: ${Math.round(focusOf(d) * 10) / 10}h focus${i === todayIdx ? ' (today)' : ''}`;
+    b.setAttribute('aria-label', b.title);
+    b.innerHTML = `<span>${escHtml(abbr3(d.day))}</span><i></i>`;
+    b.style.setProperty('--h', Math.round((focusOf(d) / maxFocus) * 100) + '%');
+    b.addEventListener('click', () => go(i));
+    chips.append(b);
+    return b;
+  });
+
+  function go(i) {
+    cur = Math.min(n - 1, Math.max(0, i));
+    cards.forEach((el, k) => {
+      el.dataset.pos = String(Math.max(-2, Math.min(2, k - cur)));
+      el.setAttribute('aria-hidden', k === cur ? 'false' : 'true'); // neighbours are previews; the focused card is the readable one
+    });
+    tabs.forEach((b, k) => { b.classList.toggle('on', k === cur); b.setAttribute('aria-current', k === cur ? 'true' : 'false'); });
+    prev.disabled = cur === 0;
+    next.disabled = cur === n - 1;
+    live.textContent = `${schedule[cur].day}, day ${cur + 1} of ${n}`;
+  }
+
+  prev.addEventListener('click', () => go(cur - 1));
+  next.addEventListener('click', () => go(cur + 1));
+  container.addEventListener('keydown', e => {
+    const step = { ArrowLeft: -1, ArrowRight: 1 }[e.key];
+    if (step) { e.preventDefault(); go(cur + step); }
+    else if (e.key === 'Home') go(0);
+    else if (e.key === 'End') go(n - 1);
+  });
+  stage.addEventListener('pointerdown', e => { x0 = e.clientX; swiped = false; });
+  stage.addEventListener('pointerup', e => {
+    if (x0 === null) return;
+    const dx = e.clientX - x0; x0 = null;
+    if (Math.abs(dx) > 48) { swiped = true; go(cur + (dx < 0 ? 1 : -1)); } // swiped flag stops the click that follows from double-navigating
+  });
+  stage.addEventListener('pointercancel', () => { x0 = null; });
+  go(cur);
+}
+
+// Exports this week's timed blocks (sleep excluded) as floating-time events, so they land at the same clock time in any calendar app.
+function downloadIcs(schedule) {
+  const now = new Date();
+  const monday = new Date(now.getFullYear(), now.getMonth(), now.getDate() - ((now.getDay() + 6) % 7));
+  const names = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'];
+  const clean = s => String(s || '').replace(/[\\;,]/g, ' ').replace(/\s+/g, ' ').trim();
+  const stamp = now.toISOString().replace(/[-:]/g, '').slice(0, 15) + 'Z';
+  const events = [];
+  schedule.forEach(d => {
+    const i = names.indexOf(abbr3(d.day).toLowerCase());
+    if (i < 0) return;
+    const date = new Date(monday.getFullYear(), monday.getMonth(), monday.getDate() + i);
+    const ymd = `${date.getFullYear()}${pad2(date.getMonth() + 1)}${pad2(date.getDate())}`;
+    (d.blocks || []).forEach((b, k) => {
+      if (b.type === 'sleep') return;
+      const [s, e] = String(b.time || '').split(/[–-]/).map(x => x.match(/(\d{1,2}):(\d{2})/));
+      if (!s || !e || +s[1] * 60 + +s[2] >= +e[1] * 60 + +e[2]) return;
+      const at = m => `${ymd}T${pad2(m[1])}${m[2]}00`;
+      events.push(['BEGIN:VEVENT', `UID:biosync-${i}-${k}-${stamp}@biosync`, `DTSTAMP:${stamp}`, `DTSTART:${at(s)}`, `DTEND:${at(e)}`, `SUMMARY:${clean(b.activity)}`, ...(b.note ? [`DESCRIPTION:${clean(b.note)}`] : []), 'END:VEVENT'].join('\r\n'));
+    });
+  });
+  if (!events.length) { toast('No timed blocks to export.'); return; }
+  const ics = ['BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//BioSync//Schedule//EN', ...events, 'END:VCALENDAR'].join('\r\n');
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([ics], { type: 'text/calendar' }));
+  a.download = 'biosync-week.ics';
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  toast(`Exported ${events.length} blocks for this week.`);
 }
 
 /* ===== Streak + daily check-in =====
@@ -715,7 +803,8 @@ function renderScheduleView(body, data) {
       <button type="button" data-view="analytics" role="tab" aria-selected="false">Analytics</button>
     </div>
     <div class="view-panel active" id="panel-week">
-      <div class="week" id="week"></div>
+      <div class="week-tools"><p>Tap a day, swipe, or use the ← → keys.</p><button type="button" class="btn ghost" id="icsBtn">Add to calendar</button></div>
+      <div id="week"></div>
     </div>
     <div class="view-panel" id="panel-analytics">
       <div class="stat-grid" id="statGrid"></div>
@@ -749,6 +838,7 @@ function renderScheduleView(body, data) {
 
   renderReasoning($('reasoningBox'), reasoningNotes);
   renderWeek($('week'), schedule);
+  $('icsBtn').addEventListener('click', () => downloadIcs(schedule));
   renderStats($('statGrid'), stats);
   renderSubjectBars($('subjectBars'), stats.subjects);
   renderTypeDonut($('typeDonut'), $('typeLegend'), schedule);
