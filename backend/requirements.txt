@@ -2,6 +2,7 @@ flask
 python-dotenv
 anthropic
 groq
+google-genai
 pdfplumber
 python-docx
 openpyxl

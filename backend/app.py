@@ -21,6 +21,14 @@ Routes match the EXACT contract already implemented in script.js:
   per-request only — see _get_user_api_key() below — and is NEVER written into
   SESSIONS, logged, or held past the single request it came in on.
 
+  Task 8b (BYO Gemini key): same routes additionally accept an optional
+  "X-Gemini-Api-Key" header, mirroring the Claude header above exactly (see
+  _get_user_gemini_api_key() below). If a request somehow sends BOTH headers,
+  the Claude one wins (see llm_client.ask()) — unchanged existing behavior for
+  anyone already using Task 8. A Gemini key here is Google's free Gemini API
+  key from https://aistudio.google.com, NOT a consumer Gemini app subscription
+  (that has no API key to paste).
+
 Session handling: single global dict keyed by Flask session cookie id.
 No login system in this MVP — one browser session = one in-progress
 schedule-building flow. Good enough for a hackathon demo; swapping in
@@ -108,6 +116,16 @@ def _get_user_api_key():
     return key.strip() if key and key.strip() else None
 
 
+def _get_user_gemini_api_key():
+    """
+    Task 8b (BYO Gemini key): exact mirror of _get_user_api_key() above, for
+    Gemini. Same per-request-only lifetime, same never-stored/never-logged
+    guarantee, same reason for a custom header name over "Authorization".
+    """
+    key = request.headers.get("X-Gemini-Api-Key")
+    return key.strip() if key and key.strip() else None
+
+
 # ---------------------------------------------------------------------
 # Serve the frontend (optional convenience — the frontend can also just
 # be opened as static files / served separately; this just makes `python
@@ -148,6 +166,7 @@ def api_chat():
 
     sdata = get_session_data()
     user_api_key = _get_user_api_key()  # Task 8 — read-only, per-request; see helper above
+    user_gemini_api_key = _get_user_gemini_api_key()  # Task 8b — same pattern, for Gemini
 
     if sdata["chat_state"] is None:
         # First message of the session — still process it as the answer to
@@ -157,7 +176,8 @@ def api_chat():
 
     reply, done, updated_state = chat_handler.handle_message(
         sdata["chat_state"], user_message,
-        user_api_key=user_api_key, effort=sdata.get("effort", "medium")
+        user_api_key=user_api_key, user_gemini_api_key=user_gemini_api_key,
+        effort=sdata.get("effort", "medium")
     )
     sdata["chat_state"] = updated_state
 
@@ -165,7 +185,7 @@ def api_chat():
         # Never let a pipeline crash turn the final chat reply into a 500.
         # The chat itself succeeded; if schedule building failed, that is
         # recorded in sdata["schedule"] and surfaced by /api/schedule.
-        _run_pipeline_safely(sdata, user_api_key=user_api_key)
+        _run_pipeline_safely(sdata, user_api_key=user_api_key, user_gemini_api_key=user_gemini_api_key)
 
     return jsonify({"reply": reply, "done": done})
 
@@ -189,7 +209,7 @@ def api_effort():
     return jsonify({"status": "ok", "level": level})
 
 
-def _run_pipeline_safely(sdata, user_api_key=None):
+def _run_pipeline_safely(sdata, user_api_key=None, user_gemini_api_key=None):
     """
     Runs _run_post_chat_pipeline() and guarantees it never raises. The LLM
     helpers already return {"success": False, ...} for LLM/JSON failures;
@@ -197,7 +217,7 @@ def _run_pipeline_safely(sdata, user_api_key=None):
     stores it as a failed schedule so /api/schedule can report it.
     """
     try:
-        _run_post_chat_pipeline(sdata, user_api_key=user_api_key)
+        _run_post_chat_pipeline(sdata, user_api_key=user_api_key, user_gemini_api_key=user_gemini_api_key)
     except Exception:
         logger.exception("Post-chat pipeline crashed unexpectedly")
         sdata["schedule"] = {
@@ -207,7 +227,7 @@ def _run_pipeline_safely(sdata, user_api_key=None):
         }
 
 
-def _run_post_chat_pipeline(sdata, user_api_key=None):
+def _run_post_chat_pipeline(sdata, user_api_key=None, user_gemini_api_key=None):
     """
     Once the chat checklist is complete, structure any uploaded documents
     and generate the schedule. Runs synchronously — fine for an MVP demo
@@ -219,10 +239,14 @@ def _run_post_chat_pipeline(sdata, user_api_key=None):
     applies to BOTH LLM steps below (structuring and schedule generation),
     since both are part of "building your schedule" from the user's POV and
     both run inside this one call. Never stored on sdata.
+    user_gemini_api_key: optional BYO Gemini key (Task 8b), same pattern as
+    user_api_key above. If both are set, Claude wins (see llm_client.ask()).
     """
     raw_texts = [doc["text"] for doc in sdata["parsed_docs"] if doc.get("success")]
 
-    structured = syllabus_structurer.structure_documents(raw_texts, user_api_key=user_api_key) if raw_texts else {
+    structured = syllabus_structurer.structure_documents(
+        raw_texts, user_api_key=user_api_key, user_gemini_api_key=user_gemini_api_key
+    ) if raw_texts else {
         "success": True,
         "data": {"subjects": [], "exams_or_deadlines": [], "parse_confidence": "low"},
         "error": None
@@ -235,7 +259,8 @@ def _run_post_chat_pipeline(sdata, user_api_key=None):
 
     result = schedule_generator.generate_schedule(
         subjects, deadlines, lifestyle_answers,
-        effort=sdata.get("effort", "medium"), user_api_key=user_api_key
+        effort=sdata.get("effort", "medium"),
+        user_api_key=user_api_key, user_gemini_api_key=user_gemini_api_key
     )
     sdata["schedule"] = result
 
@@ -319,7 +344,9 @@ def _classify_schedule_failure(result):
     Map a failed pipeline result to a stable reason code. schedule_generator
     only hands back an error string, so rate limits are recognised from the
     provider's own error text (Groq and Anthropic both surface HTTP 429 /
-    "rate_limit" in it).
+    "rate_limit" in it; Gemini surfaces HTTP 429 with status
+    "RESOURCE_EXHAUSTED", which the pattern below also catches via the
+    literal "429").
     """
     reason = result.get("reason")
     if reason in SCHEDULE_ERROR_MESSAGES:
@@ -377,10 +404,11 @@ def api_schedule():
 def api_schedule_retry():
     sdata = get_session_data()
     user_api_key = _get_user_api_key()  # Task 8 — same read-only, per-request pattern as api_chat()
+    user_gemini_api_key = _get_user_gemini_api_key()  # Task 8b — same pattern, for Gemini
     result = sdata.get("schedule")
     last_attempt_failed = result is None or not result.get("success")
     if chat_handler.is_complete(sdata["chat_state"]) and last_attempt_failed:
-        _run_pipeline_safely(sdata, user_api_key=user_api_key)
+        _run_pipeline_safely(sdata, user_api_key=user_api_key, user_gemini_api_key=user_gemini_api_key)
     return jsonify(_schedule_payload(sdata))
 
 

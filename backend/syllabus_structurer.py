@@ -20,7 +20,7 @@ directly without more parsing.
 
 import json
 import logging
-from llm_client import ask, CLAUDE_MODEL
+from llm_client import ask, CLAUDE_MODEL, GEMINI_MODEL_FLASH
 
 logger = logging.getLogger(__name__)
 
@@ -73,7 +73,7 @@ def _extract_json(raw_text):
     return cleaned.strip()
 
 
-def structure_documents(raw_texts, user_api_key=None):
+def structure_documents(raw_texts, user_api_key=None, user_gemini_api_key=None):
     """
     raw_texts: list of strings — the .text from one or more ParseResult objects
                (document_parser.py), already filtered to successful parses only.
@@ -87,6 +87,12 @@ def structure_documents(raw_texts, user_api_key=None):
                extraction task, not deep reasoning, so there's no reason to spend
                Sonnet/Opus tokens on it even when the user has opted into their own
                key and selected a higher effort tier for schedule generation.
+    user_gemini_api_key: optional caller-supplied Gemini key (Task 8b, BYO Gemini
+               key), same threading rationale as user_api_key above. Always on
+               GEMINI_MODEL_FLASH here for the same reason Claude is pinned to
+               Haiku — extraction, not deep reasoning, so no need for a bigger
+               model even at a higher effort tier. If both keys are somehow set,
+               Claude wins (see llm_client.ask()).
 
     Returns a dict:
       {
@@ -115,13 +121,15 @@ def structure_documents(raw_texts, user_api_key=None):
     ]
 
     try:
+        model = CLAUDE_MODEL if user_api_key else (GEMINI_MODEL_FLASH if user_gemini_api_key else None)
         reply, _, _ = ask(
             system_prompt=SYSTEM_PROMPT,
             conversation_history=conversation,
             provider=PROVIDER,
             max_tokens=2000,
             user_api_key=user_api_key,
-            model=CLAUDE_MODEL if user_api_key else None
+            user_gemini_api_key=user_gemini_api_key,
+            model=model
         )
     except Exception as e:
         logger.error(f"Syllabus structuring LLM call failed: {e}")

@@ -11,14 +11,16 @@ we just always know which question we're on.
 Provider: Groq by default (fast, free, this runs on every single message
 so cost/speed matters more than peak reasoning quality here). Can be
 switched to Claude via provider="claude" in ask_chat(), or by setting
-DEFAULT_LLM_PROVIDER=claude in .env.
+DEFAULT_LLM_PROVIDER=claude in .env. Gemini is supported the same way
+(provider="gemini" / DEFAULT_LLM_PROVIDER=gemini), and via BYO key — see
+user_gemini_api_key below.
 
 This module holds per-session chat state in memory (a dict). No database —
 if the Flask process restarts, in-progress conversations are lost. That's
 an accepted MVP tradeoff, noted in the README.
 """
 
-from llm_client import ask, CLAUDE_MODEL_BY_EFFORT
+from llm_client import ask, CLAUDE_MODEL_BY_EFFORT, GEMINI_MODEL_BY_EFFORT
 
 # ---- The fixed checklist ----
 # Each step has: the field name we're collecting, and the exact question
@@ -78,7 +80,7 @@ def get_greeting():
     )
 
 
-def handle_message(session_state, user_message, user_api_key=None, effort="medium"):
+def handle_message(session_state, user_message, user_api_key=None, user_gemini_api_key=None, effort="medium"):
     """
     Process one incoming user message for this session.
 
@@ -88,11 +90,16 @@ def handle_message(session_state, user_message, user_api_key=None, effort="mediu
         read fresh from the request by app.py each call, never stored in
         session_state. When present, this turn's reply comes from Claude (model
         tier picked by `effort`) instead of the shared Groq key.
+    user_gemini_api_key: optional caller-supplied Gemini key (Task 8b, BYO Gemini
+        key), same pattern as user_api_key above. When present (and
+        user_api_key is not), this turn's reply comes from Gemini (model tier
+        picked by `effort` via GEMINI_MODEL_BY_EFFORT) instead of the shared
+        Groq key.
     effort: "low" | "medium" | "high" (Task 7's effort selector) — only changes
-        anything here when user_api_key is also set, since it picks the Claude
-        model tier (CLAUDE_MODEL_BY_EFFORT). Groq's chat replies are short
-        (max_tokens=200) regardless of effort; that was never the overflow
-        problem, so the Groq path here is intentionally left as-is.
+        anything here when user_api_key or user_gemini_api_key is also set,
+        since it picks the Claude/Gemini model tier. Groq's chat replies are
+        short (max_tokens=200) regardless of effort; that was never the
+        overflow problem, so the Groq path here is intentionally left as-is.
 
     Returns: (reply_text, done_bool, updated_session_state)
     """
@@ -140,13 +147,15 @@ def handle_message(session_state, user_message, user_api_key=None, effort="mediu
 
     try:
         claude_model = CLAUDE_MODEL_BY_EFFORT.get(effort) if user_api_key else None
+        gemini_model = GEMINI_MODEL_BY_EFFORT.get(effort) if user_gemini_api_key else None
         reply, _, _ = ask(
             system_prompt=system_prompt,
             conversation_history=session_state["history"],
             provider=PROVIDER,
             max_tokens=200,
             user_api_key=user_api_key,
-            model=claude_model
+            user_gemini_api_key=user_gemini_api_key,
+            model=claude_model or gemini_model
         )
     except Exception:
         # Fallback: if the LLM call fails for any reason (bad key, rate limit,

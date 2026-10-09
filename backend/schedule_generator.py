@@ -43,15 +43,29 @@ reused to pick a Claude model tier instead of a Groq max_tokens tier (see
 llm_client.CLAUDE_MODEL_BY_EFFORT / CLAUDE_MAX_TOKENS_BY_EFFORT) — one
 control, two different meanings depending on which provider is in play.
 This module never stores or logs that key; see llm_client.ask().
+
+--- BYO Gemini key (Task 8b) ---
+Same pattern as the Claude key above, for a caller-supplied user_gemini_api_key:
+this is the step most worth moving off Groq, since Gemini's free-tier TPM
+(~250K) is roughly 30x Groq's free-tier TPM on gpt-oss-120b (~8K) — the actual
+ceiling that was truncating full-detail responses mid-JSON, more so than the
+old flat max_tokens=3000 ever was. If both user_api_key and
+user_gemini_api_key are set, Claude wins (see llm_client.ask()) — this module
+doesn't need its own precedence logic, it just passes both through.
 """
 
 import json
 import logging
-from llm_client import ask, CLAUDE_MODEL_BY_EFFORT, CLAUDE_MAX_TOKENS_BY_EFFORT
+from llm_client import (
+    ask,
+    CLAUDE_MODEL_BY_EFFORT, CLAUDE_MAX_TOKENS_BY_EFFORT,
+    GEMINI_MODEL_BY_EFFORT, GEMINI_MAX_TOKENS_BY_EFFORT,
+)
 
 logger = logging.getLogger(__name__)
 
-PROVIDER = "groq"  # change to "claude" here to use Claude (needs ANTHROPIC_API_KEY)
+PROVIDER = "groq"  # change to "claude" or "gemini" here to use that provider by default
+                    # (needs ANTHROPIC_API_KEY or GEMINI_API_KEY respectively in .env)
 
 # Groq-side max_tokens per effort tier (see module docstring for why these numbers).
 GROQ_MAX_TOKENS_BY_EFFORT = {"low": 2000, "medium": 5000, "high": 5000}
@@ -256,7 +270,8 @@ def _build_user_prompt(subjects, exams_or_deadlines, lifestyle_answers):
     return "\n".join(lines)
 
 
-def generate_schedule(subjects, exams_or_deadlines, lifestyle_answers, effort=None, user_api_key=None):
+def generate_schedule(subjects, exams_or_deadlines, lifestyle_answers, effort=None,
+                       user_api_key=None, user_gemini_api_key=None):
     """
     subjects: list of dicts from syllabus_structurer.py's "subjects" field (can be empty list)
     exams_or_deadlines: list of dicts from syllabus_structurer.py (can be empty list)
@@ -268,6 +283,14 @@ def generate_schedule(subjects, exams_or_deadlines, lifestyle_answers, effort=No
             When present, this call goes to Claude instead of Groq, using the model
             tier CLAUDE_MODEL_BY_EFFORT[effort] maps to. Never stored here — passed
             straight through to llm_client.ask() for this one call only.
+    user_gemini_api_key: optional caller-supplied Gemini key (Task 8b, BYO Gemini
+            key). When present (and user_api_key is not), this call goes to Gemini
+            instead of Groq, using the model tier GEMINI_MODEL_BY_EFFORT[effort]
+            maps to and the GEMINI_MAX_TOKENS_BY_EFFORT ceiling for that tier. This
+            is the step where Gemini is most worth it: Gemini's free-tier TPM is
+            far above Groq's, which is what was actually truncating full-detail
+            schedules. Never stored here — passed straight through to
+            llm_client.ask() for this one call only.
 
     Returns:
       {
@@ -289,6 +312,9 @@ def generate_schedule(subjects, exams_or_deadlines, lifestyle_answers, effort=No
     if user_api_key:
         model = CLAUDE_MODEL_BY_EFFORT[effort]
         max_tokens = CLAUDE_MAX_TOKENS_BY_EFFORT[effort]
+    elif user_gemini_api_key:
+        model = GEMINI_MODEL_BY_EFFORT[effort]
+        max_tokens = GEMINI_MAX_TOKENS_BY_EFFORT[effort]
     else:
         model = None  # unused for Groq
         max_tokens = GROQ_MAX_TOKENS_BY_EFFORT[effort]
@@ -304,6 +330,7 @@ def generate_schedule(subjects, exams_or_deadlines, lifestyle_answers, effort=No
             provider=PROVIDER,
             max_tokens=max_tokens,
             user_api_key=user_api_key,
+            user_gemini_api_key=user_gemini_api_key,
             model=model
         )
     except Exception as e:
