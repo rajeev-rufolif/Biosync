@@ -36,6 +36,25 @@ Then open `.env` and fill in:
   no provider. All three scripts pass one explicitly, so changing this value
   does not by itself switch them.
 
+## 3b. Schedule detail (Low/Medium/High) and bring-your-own Claude key
+- The chat page has a Low/Medium/High "Schedule detail" selector. It changes
+  how much per-block detail `schedule_generator.py` asks the LLM for and its
+  `max_tokens` budget — Low=2000, Medium/High=5000 on Groq (see that file's
+  module docstring for the full reasoning; this replaced a single flat
+  `max_tokens=3000` that was truncating full-detail responses mid-JSON).
+  Stored server-side per session (`POST /api/effort`), defaults to Medium.
+- Also on the chat page: an opt-in "Use my own Claude API key" control. When
+  on, that request's chat/structuring/schedule-generation calls use the
+  pasted key instead of the shared `ANTHROPIC_API_KEY`/`GROQ_API_KEY` — sent
+  only as the `X-Anthropic-Api-Key` header on `/api/chat` and
+  `/api/schedule/retry`, kept in the browser's `sessionStorage` only (cleared
+  when the tab closes), never written to `SESSIONS`, a log, or disk. On this
+  path, the SAME Low/Medium/High selector picks a Claude model tier instead
+  of a Groq token tier: Low→`claude-haiku-4-5-20251001` (already the only
+  Claude model this repo used), Medium→`claude-sonnet-5-5`, High→
+  `claude-opus-5-5` (see `llm_client.py`'s `CLAUDE_MODEL_BY_EFFORT`), each
+  with a materially higher `max_tokens` (4000/8000/16000) than the Groq tiers.
+
 ## 4. Run it
 ```
 python app.py
@@ -111,3 +130,6 @@ breaks if an older backend build is swapped in.
 - Groq's free tier is rate-limited. When it rejects a request the results
   page says so and offers a retry, plus a clearly labeled example schedule.
   The example is also available any time at `results.html?example=1`.
+- The Low effort tier is the one most likely to reliably finish on Groq's
+  free tier; High is opt-in and still the most likely of the three to run
+  long on Groq (it asks for the most detail) — that's expected, not a bug.

@@ -10,6 +10,16 @@ Routes match the EXACT contract already implemented in script.js:
                                                            (full shape documented above api_schedule())
   POST /api/schedule/retry -> (no body)                 => same shape as GET /api/schedule, after re-running
                                                            the pipeline if the last attempt failed
+  POST /api/effort     -> {"level": "low"|"medium"|"high"} => {"status": "ok", "level": "..."}
+                                                           Task 7's effort selector — stored in SESSIONS
+                                                           alongside chat_state, read when the pipeline runs.
+
+  Task 8 (BYO Claude key): POST /api/chat and POST /api/schedule/retry additionally
+  accept an optional "X-Anthropic-Api-Key" request header. When present, the LLM
+  calls that request triggers use that key (via llm_client.ask()'s user_api_key
+  param) instead of the shared GROQ_API_KEY/ANTHROPIC_API_KEY. This header is read
+  per-request only — see _get_user_api_key() below — and is NEVER written into
+  SESSIONS, logged, or held past the single request it came in on.
 
 Session handling: single global dict keyed by Flask session cookie id.
 No login system in this MVP — one browser session = one in-progress
@@ -55,7 +65,12 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 #   "parsed_docs": [ParseResult.to_dict(), ...],
 #   "structured_data": {...} or None,
 #   "schedule": [...] or None,
+#   "effort": "low" | "medium" | "high"  (Task 7 — set via POST /api/effort,
+#             defaults to "medium"; read when the pipeline runs)
 # }
+# Deliberately NOT stored here: a BYO Claude key (Task 8). That is read fresh,
+# per-request, by _get_user_api_key() and passed straight through the pipeline
+# call chain as a plain function argument — see api_chat()/api_schedule_retry().
 SESSIONS = {}
 
 
@@ -73,8 +88,24 @@ def get_session_data():
             "parsed_docs": [],
             "structured_data": None,
             "schedule": None,
+            "effort": "medium",
         }
     return SESSIONS[sid]
+
+
+def _get_user_api_key():
+    """
+    Task 8 (BYO Claude key): pulls the user-supplied Anthropic key straight off
+    THIS request's headers, if present, and returns it. That's it — the caller
+    (api_chat / api_schedule_retry) passes the return value straight down the
+    pipeline call chain as a plain argument. It must never be assigned into
+    `session`, `SESSIONS`, or any other variable that outlives this request, and
+    must never be passed to logger.info/logger.error. Header name is a deliberate
+    choice (not "Authorization", to avoid any confusion with a real auth scheme
+    this app doesn't otherwise have).
+    """
+    key = request.headers.get("X-Anthropic-Api-Key")
+    return key.strip() if key and key.strip() else None
 
 
 # ---------------------------------------------------------------------
@@ -116,6 +147,7 @@ def api_chat():
         return jsonify({"reply": "Could you type something first?", "done": False}), 400
 
     sdata = get_session_data()
+    user_api_key = _get_user_api_key()  # Task 8 — read-only, per-request; see helper above
 
     if sdata["chat_state"] is None:
         # First message of the session — still process it as the answer to
@@ -123,19 +155,41 @@ def api_chat():
         # client-side (script.js shows GREETING locally before any API call).
         sdata["chat_state"] = chat_handler._new_session_state()
 
-    reply, done, updated_state = chat_handler.handle_message(sdata["chat_state"], user_message)
+    reply, done, updated_state = chat_handler.handle_message(
+        sdata["chat_state"], user_message,
+        user_api_key=user_api_key, effort=sdata.get("effort", "medium")
+    )
     sdata["chat_state"] = updated_state
 
     if done:
         # Never let a pipeline crash turn the final chat reply into a 500.
         # The chat itself succeeded; if schedule building failed, that is
         # recorded in sdata["schedule"] and surfaced by /api/schedule.
-        _run_pipeline_safely(sdata)
+        _run_pipeline_safely(sdata, user_api_key=user_api_key)
 
     return jsonify({"reply": reply, "done": done})
 
 
-def _run_pipeline_safely(sdata):
+# ---------------------------------------------------------------------
+# POST /api/effort — Task 7's Low/Medium/High effort selector. Stored in
+# SESSIONS alongside chat_state (not in the Flask cookie itself, same as
+# everything else keyed by session id); read by _run_post_chat_pipeline()
+# whenever it eventually runs, however many messages later that is.
+# ---------------------------------------------------------------------
+@app.route("/api/effort", methods=["POST"])
+def api_effort():
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        data = {}
+    level = str(data.get("level") or "").strip().lower()
+    if level not in ("low", "medium", "high"):
+        return jsonify({"error": "level must be 'low', 'medium', or 'high'."}), 400
+    sdata = get_session_data()
+    sdata["effort"] = level
+    return jsonify({"status": "ok", "level": level})
+
+
+def _run_pipeline_safely(sdata, user_api_key=None):
     """
     Runs _run_post_chat_pipeline() and guarantees it never raises. The LLM
     helpers already return {"success": False, ...} for LLM/JSON failures;
@@ -143,7 +197,7 @@ def _run_pipeline_safely(sdata):
     stores it as a failed schedule so /api/schedule can report it.
     """
     try:
-        _run_post_chat_pipeline(sdata)
+        _run_post_chat_pipeline(sdata, user_api_key=user_api_key)
     except Exception:
         logger.exception("Post-chat pipeline crashed unexpectedly")
         sdata["schedule"] = {
@@ -153,16 +207,22 @@ def _run_pipeline_safely(sdata):
         }
 
 
-def _run_post_chat_pipeline(sdata):
+def _run_post_chat_pipeline(sdata, user_api_key=None):
     """
     Once the chat checklist is complete, structure any uploaded documents
     and generate the schedule. Runs synchronously — fine for an MVP demo
     with a handful of small files; a production version would background
     this and let the frontend poll, but that's unnecessary complexity here.
+
+    user_api_key: optional BYO Claude key (Task 8), read fresh by the caller
+    from the triggering request's headers and passed straight through —
+    applies to BOTH LLM steps below (structuring and schedule generation),
+    since both are part of "building your schedule" from the user's POV and
+    both run inside this one call. Never stored on sdata.
     """
     raw_texts = [doc["text"] for doc in sdata["parsed_docs"] if doc.get("success")]
 
-    structured = syllabus_structurer.structure_documents(raw_texts) if raw_texts else {
+    structured = syllabus_structurer.structure_documents(raw_texts, user_api_key=user_api_key) if raw_texts else {
         "success": True,
         "data": {"subjects": [], "exams_or_deadlines": [], "parse_confidence": "low"},
         "error": None
@@ -173,7 +233,10 @@ def _run_post_chat_pipeline(sdata):
     deadlines = structured["data"]["exams_or_deadlines"] if structured["success"] else []
     lifestyle_answers = chat_handler.get_collected_answers(sdata["chat_state"])
 
-    result = schedule_generator.generate_schedule(subjects, deadlines, lifestyle_answers)
+    result = schedule_generator.generate_schedule(
+        subjects, deadlines, lifestyle_answers,
+        effort=sdata.get("effort", "medium"), user_api_key=user_api_key
+    )
     sdata["schedule"] = result
 
 
@@ -313,10 +376,11 @@ def api_schedule():
 @app.route("/api/schedule/retry", methods=["POST"])
 def api_schedule_retry():
     sdata = get_session_data()
+    user_api_key = _get_user_api_key()  # Task 8 — same read-only, per-request pattern as api_chat()
     result = sdata.get("schedule")
     last_attempt_failed = result is None or not result.get("success")
     if chat_handler.is_complete(sdata["chat_state"]) and last_attempt_failed:
-        _run_pipeline_safely(sdata)
+        _run_pipeline_safely(sdata, user_api_key=user_api_key)
     return jsonify(_schedule_payload(sdata))
 
 

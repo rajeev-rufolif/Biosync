@@ -13,6 +13,14 @@ Provider selection: each script passes its own `provider` argument
 free tier needs a GROQ_API_KEY. Claude is supported as an alternate provider
 (needs ANTHROPIC_API_KEY); flip any single script to it by changing that
 script's PROVIDER constant — one line each.
+
+BYO-key path (Task 8): a caller can instead pass `user_api_key` to ask().
+When present it overrides the provider arg above entirely — the call always
+goes to Claude, using that caller-supplied key via a fresh, one-off client
+(see create_client's api_key_override). This never touches ANTHROPIC_API_KEY,
+SESSIONS, or any server-side storage; see app.py for where that key is read
+from the request and chat_handler.py/schedule_generator.py for how it's
+threaded through.
 """
 
 import os
@@ -40,20 +48,49 @@ logger = logging.getLogger(__name__)
 CLAUDE_MODEL = "claude-haiku-4-5-20251001"
 GROQ_MODEL = "openai/gpt-oss-120b"
 
+# Added for the BYO-Claude-key feature: a user who brings their own Anthropic key
+# picks a model tier via the SAME Low/Medium/High effort selector used for the
+# shared Groq path (see schedule_generator.py / chat_handler.py), instead of a
+# second "pick your model" control. CLAUDE_MODEL (Haiku, above) is reused as-is
+# for "low" — it was already the only Claude model in this file. These two are
+# new; verified against Anthropic's current model listing before hardcoding.
+CLAUDE_MODEL_SONNET = "claude-sonnet-5-5"
+CLAUDE_MODEL_OPUS = "claude-opus-5-5"
+
+CLAUDE_MODEL_BY_EFFORT = {
+    "low": CLAUDE_MODEL,
+    "medium": CLAUDE_MODEL_SONNET,
+    "high": CLAUDE_MODEL_OPUS,
+}
+
+# Claude's paid API has a far higher per-response ceiling than Groq's free tier
+# (which is what Task 7 hit at a self-imposed max_tokens=3000). These numbers are
+# deliberately NOT a reuse of the Groq tiers' 3000/5000 — the whole point of the
+# BYO-key path is removing that ceiling, so each tier gets real headroom.
+CLAUDE_MAX_TOKENS_BY_EFFORT = {"low": 4000, "medium": 8000, "high": 16000}
+
 DEFAULT_PROVIDER = os.getenv("DEFAULT_LLM_PROVIDER", "groq").strip().lower()
 
 
-def create_client(provider):
-    """Create and return an API client for 'claude' or 'groq'."""
+def create_client(provider, api_key_override=None):
+    """
+    Create and return an API client for 'claude' or 'groq'.
+
+    api_key_override: used only by the BYO-key path (provider="claude") — when
+    present, builds the client from this caller-supplied key instead of the
+    shared ANTHROPIC_API_KEY env var. Never logged. This function always
+    returns a brand-new client (there is no module-level/cached client here),
+    so a BYO-key call and the shared-key path never share a client instance.
+    """
     if provider == "claude":
-        api_key = os.getenv("ANTHROPIC_API_KEY")
+        api_key = api_key_override or os.getenv("ANTHROPIC_API_KEY")
         if not api_key:
             raise ValueError(
                 "ANTHROPIC_API_KEY missing. Add it to your .env file, "
                 "or switch this call to provider='groq' if you don't have a Claude key."
             )
         client = anthropic.Anthropic(api_key=api_key)
-        logger.info("Anthropic client created")
+        logger.info("Anthropic client created" + (" (user-supplied key)" if api_key_override else ""))
         return client
 
     elif provider == "groq":
@@ -68,24 +105,39 @@ def create_client(provider):
         raise ValueError(f"Unknown provider '{provider}'. Use 'claude' or 'groq'.")
 
 
-def ask(system_prompt, conversation_history, provider=None, max_tokens=1024):
+def ask(system_prompt, conversation_history, provider=None, max_tokens=1024, user_api_key=None, model=None):
     """
     Send a conversation to the chosen LLM and get back the full reply (no streaming —
     this is a web backend, not a CLI, so we wait for the full response and return it).
 
     conversation_history: list of {"role": "user"|"assistant", "content": "..."}
     provider: "claude" or "groq". If None, uses DEFAULT_LLM_PROVIDER from .env (defaults to groq).
+              Ignored when user_api_key is given (see below).
+    user_api_key: optional caller-supplied Anthropic API key (BYO-key feature, Task 8).
+              When present, this call ALWAYS goes to Claude, using a fresh client built
+              from this key only (never the shared ANTHROPIC_API_KEY, never cached —
+              `client` here is a local variable that goes out of scope when this
+              function returns, so nothing about this key outlives this one call). The
+              key itself is never written to a log line by this function; callers
+              (chat_handler.py, syllabus_structurer.py, schedule_generator.py, app.py)
+              must not store it anywhere either.
+    model: explicit Claude model ID to use when provider is (or becomes) "claude" —
+              e.g. one of CLAUDE_MODEL_BY_EFFORT's values. Falls back to CLAUDE_MODEL.
 
     Returns: (reply_text, input_tokens, output_tokens)
     Raises: ValueError (bad/missing key), or the underlying API exception on failure —
             callers are expected to catch these and return a friendly error to the user.
     """
-    provider = (provider or DEFAULT_PROVIDER).strip().lower()
-    client = create_client(provider)
+    if user_api_key:
+        provider = "claude"
+        client = create_client("claude", api_key_override=user_api_key)
+    else:
+        provider = (provider or DEFAULT_PROVIDER).strip().lower()
+        client = create_client(provider)
 
     if provider == "claude":
         response = client.messages.create(
-            model=CLAUDE_MODEL,
+            model=model or CLAUDE_MODEL,
             max_tokens=max_tokens,
             system=system_prompt,
             messages=conversation_history

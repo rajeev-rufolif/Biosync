@@ -18,7 +18,7 @@ if the Flask process restarts, in-progress conversations are lost. That's
 an accepted MVP tradeoff, noted in the README.
 """
 
-from llm_client import ask
+from llm_client import ask, CLAUDE_MODEL_BY_EFFORT
 
 # ---- The fixed checklist ----
 # Each step has: the field name we're collecting, and the exact question
@@ -78,12 +78,21 @@ def get_greeting():
     )
 
 
-def handle_message(session_state, user_message):
+def handle_message(session_state, user_message, user_api_key=None, effort="medium"):
     """
     Process one incoming user message for this session.
 
     session_state: dict from _new_session_state() (or an existing one for this session)
     user_message: the text the student just sent
+    user_api_key: optional caller-supplied Anthropic key (Task 8, BYO Claude key) —
+        read fresh from the request by app.py each call, never stored in
+        session_state. When present, this turn's reply comes from Claude (model
+        tier picked by `effort`) instead of the shared Groq key.
+    effort: "low" | "medium" | "high" (Task 7's effort selector) — only changes
+        anything here when user_api_key is also set, since it picks the Claude
+        model tier (CLAUDE_MODEL_BY_EFFORT). Groq's chat replies are short
+        (max_tokens=200) regardless of effort; that was never the overflow
+        problem, so the Groq path here is intentionally left as-is.
 
     Returns: (reply_text, done_bool, updated_session_state)
     """
@@ -130,11 +139,14 @@ def handle_message(session_state, user_message):
     system_prompt = SYSTEM_PROMPT_TEMPLATE.format(current_question=next_question)
 
     try:
+        claude_model = CLAUDE_MODEL_BY_EFFORT.get(effort) if user_api_key else None
         reply, _, _ = ask(
             system_prompt=system_prompt,
             conversation_history=session_state["history"],
             provider=PROVIDER,
-            max_tokens=200
+            max_tokens=200,
+            user_api_key=user_api_key,
+            model=claude_model
         )
     except Exception:
         # Fallback: if the LLM call fails for any reason (bad key, rate limit,

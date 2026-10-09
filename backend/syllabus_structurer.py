@@ -20,7 +20,7 @@ directly without more parsing.
 
 import json
 import logging
-from llm_client import ask
+from llm_client import ask, CLAUDE_MODEL
 
 logger = logging.getLogger(__name__)
 
@@ -73,10 +73,20 @@ def _extract_json(raw_text):
     return cleaned.strip()
 
 
-def structure_documents(raw_texts):
+def structure_documents(raw_texts, user_api_key=None):
     """
     raw_texts: list of strings — the .text from one or more ParseResult objects
                (document_parser.py), already filtered to successful parses only.
+    user_api_key: optional caller-supplied Anthropic key (Task 8, BYO Claude key).
+               Threaded through so a user's whole post-chat pipeline — structuring
+               AND schedule generation, both of which run inside the same
+               _run_post_chat_pipeline() call in app.py — uses their own key
+               consistently, not just the final schedule-building step. Always on
+               CLAUDE_MODEL (Haiku) here regardless of the Low/Medium/High effort
+               selector: per this module's own docstring, structuring is an
+               extraction task, not deep reasoning, so there's no reason to spend
+               Sonnet/Opus tokens on it even when the user has opted into their own
+               key and selected a higher effort tier for schedule generation.
 
     Returns a dict:
       {
@@ -109,7 +119,9 @@ def structure_documents(raw_texts):
             system_prompt=SYSTEM_PROMPT,
             conversation_history=conversation,
             provider=PROVIDER,
-            max_tokens=2000
+            max_tokens=2000,
+            user_api_key=user_api_key,
+            model=CLAUDE_MODEL if user_api_key else None
         )
     except Exception as e:
         logger.error(f"Syllabus structuring LLM call failed: {e}")

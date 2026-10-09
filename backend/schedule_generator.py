@@ -15,17 +15,49 @@ worth moving to Claude: set PROVIDER = "claude" (needs ANTHROPIC_API_KEY).
 
 Output is forced into the exact JSON shape results.html already expects
 (see script.js MOCK_SCHEDULE) — no translation layer needed in app.py.
+
+--- Effort tiers (Task 7) ---
+This is the step that was overflowing Groq's free tier: the prompt below
+asked for full per-block detail at max_tokens=3000, and Groq's own
+openai/gpt-oss-120b model (confirmed max_completion_tokens=65,536 — nowhere
+close to the actual problem) cut the response off exactly at that
+self-imposed 3000-token ceiling, mid-JSON. Three tiers fix this by varying
+BOTH how much detail is requested (less content = fewer tokens needed to
+finish) AND the token budget itself:
+  - low:    compact — no per-block "note", a terse focus_summary/reasoning.
+            max_tokens=2000. This is the tier that MUST reliably finish on
+            Groq free tier, so it asks for the least and gets the most
+            relative headroom.
+  - medium: today's normal level of detail, trimmed slightly (shorter note
+            clauses, 2-3 sentence reasoning instead of 2-4).
+  - high:   exactly the original, full-detail prompt — unchanged, still the
+            one most likely to run long. Opt-in once low/medium exist.
+Medium and High share max_tokens=5000 (raised from the old flat 3000, the
+number requested) — real headroom per Task 7(b); they're told apart by
+prompt detail rather than token budget, since High's own prompt asking for
+more content is what makes it more likely to still run long even at 5000.
+
+--- BYO Claude key (Task 8) ---
+If a caller passes user_api_key, the SAME low/medium/high effort value is
+reused to pick a Claude model tier instead of a Groq max_tokens tier (see
+llm_client.CLAUDE_MODEL_BY_EFFORT / CLAUDE_MAX_TOKENS_BY_EFFORT) — one
+control, two different meanings depending on which provider is in play.
+This module never stores or logs that key; see llm_client.ask().
 """
 
 import json
 import logging
-from llm_client import ask
+from llm_client import ask, CLAUDE_MODEL_BY_EFFORT, CLAUDE_MAX_TOKENS_BY_EFFORT
 
 logger = logging.getLogger(__name__)
 
 PROVIDER = "groq"  # change to "claude" here to use Claude (needs ANTHROPIC_API_KEY)
 
-SYSTEM_PROMPT = """You are an expert in student time management, productivity, and \
+# Groq-side max_tokens per effort tier (see module docstring for why these numbers).
+GROQ_MAX_TOKENS_BY_EFFORT = {"low": 2000, "medium": 5000, "high": 5000}
+DEFAULT_EFFORT = "medium"
+
+_INTRO_AND_PRINCIPLES = """You are an expert in student time management, productivity, and \
 chronobiology. You build realistic, personalized weekly study schedules — not generic \
 advice, but schedules reasoned from the specific student's subjects, routine, and body's \
 natural patterns.
@@ -47,8 +79,25 @@ before sleep.
 them. Do not overload the schedule past what they told you they can actually do.
 - Exams/deadlines: if any were extracted from their documents, give those subjects extra \
 blocks in the days leading up to the date.
+"""
 
-Respond ONLY with valid JSON, no preamble, no markdown fences, in exactly this shape:
+_COMMON_RULES = """- Cover all 7 days, Monday through Sunday.
+- Every activity description should be specific (name the actual subject), not vague \
+("study" is bad, "Deep focus: Data Structures problem set" is good).
+- Include meals and breaks, not just study blocks — this is a full day schedule, not just \
+a study plan.
+- Keep total daily study load realistic to what the student stated.
+- Times should be in "H:MM–H:MM" 24-hour-ish readable format matching the example above.
+- "energy" should reflect the REAL circadian/food-driven energy level you reasoned about for \
+that slot — not a constant value. Vary it across the day (e.g. low right after a heavy meal \
+or during the 1-3pm dip, high in the student's stated peak window).
+- subject_breakdown should include every subject from SUBJECTS that got at least one study \
+block; weekly_focus_hours should equal the sum of subject_breakdown's hours (sanity-check \
+your own arithmetic before responding).
+"""
+
+# ---- HIGH: the original, full-detail prompt (what's live today). Unchanged. ----
+_HIGH_JSON_SHAPE = """Respond ONLY with valid JSON, no preamble, no markdown fences, in exactly this shape:
 
 {
   "schedule": [
@@ -75,20 +124,90 @@ Respond ONLY with valid JSON, no preamble, no markdown fences, in exactly this s
 }
 
 Rules:
-- Cover all 7 days, Monday through Sunday.
-- Every activity description should be specific (name the actual subject), not vague \
-("study" is bad, "Deep focus: Data Structures problem set" is good).
-- Include meals and breaks, not just study blocks — this is a full day schedule, not just \
-a study plan.
-- Keep total daily study load realistic to what the student stated.
-- Times should be in "H:MM–H:MM" 24-hour-ish readable format matching the example above.
-- "energy" should reflect the REAL circadian/food-driven energy level you reasoned about for \
-that slot — not a constant value. Vary it across the day (e.g. low right after a heavy meal \
-or during the 1-3pm dip, high in the student's stated peak window).
-- subject_breakdown should include every subject from SUBJECTS that got at least one study \
-block; weekly_focus_hours should equal the sum of subject_breakdown's hours (sanity-check \
-your own arithmetic before responding).
 """
+HIGH_SYSTEM_PROMPT = _INTRO_AND_PRINCIPLES + "\n" + _HIGH_JSON_SHAPE + _COMMON_RULES
+
+# ---- MEDIUM: today's normal detail, trimmed — shorter notes, shorter reasoning. ----
+_MEDIUM_JSON_SHAPE = """Respond ONLY with valid JSON, no preamble, no markdown fences, in exactly this shape:
+
+{
+  "schedule": [
+    {
+      "day": "Monday",
+      "focus_summary": "one short sentence on what this day is built around",
+      "blocks": [
+        {
+          "time": "7:00–8:00",
+          "activity": "short, specific activity description",
+          "type": "study" | "break" | "meal" | "sleep" | "class" | "other",
+          "subject": "subject name if type is study or class, else empty string",
+          "energy": "high" | "medium" | "low",
+          "note": "a FEW WORDS on why this block is placed here (not a full sentence) — empty string if self-explanatory"
+        }
+      ]
+    }
+  ],
+  "reasoning_notes": "2-3 sentences explaining the key scheduling decisions you made and why, referencing this student's specific answers",
+  "weekly_focus_hours": <number, total hours of type="study" blocks across the whole week, computed by you from the schedule you just built>,
+  "subject_breakdown": [
+    { "subject": "subject name", "hours_this_week": <number, sum of study block durations for this subject> }
+  ]
+}
+
+Keep every string field as short as you can while staying accurate and specific — this \
+response needs to fit comfortably in a moderate token budget.
+
+Rules:
+"""
+MEDIUM_SYSTEM_PROMPT = _INTRO_AND_PRINCIPLES + "\n" + _MEDIUM_JSON_SHAPE + _COMMON_RULES
+
+# ---- LOW: compact — no per-block "note" at all, terse everything else. ----
+# This is the tier that MUST reliably finish on Groq free tier, so it asks for
+# meaningfully less content rather than just hoping a smaller max_tokens is enough.
+_LOW_JSON_SHAPE = """Respond ONLY with valid JSON, no preamble, no markdown fences, in exactly this shape:
+
+{
+  "schedule": [
+    {
+      "day": "Monday",
+      "focus_summary": "",
+      "blocks": [
+        {
+          "time": "7:00–8:00",
+          "activity": "short, specific activity description",
+          "type": "study" | "break" | "meal" | "sleep" | "class" | "other",
+          "subject": "subject name if type is study or class, else empty string",
+          "energy": "high" | "medium" | "low",
+          "note": ""
+        }
+      ]
+    }
+  ],
+  "reasoning_notes": "1-2 sentences, max 30 words total, explaining the single biggest scheduling decision you made",
+  "weekly_focus_hours": <number, total hours of type="study" blocks across the whole week, computed by you from the schedule you just built>,
+  "subject_breakdown": [
+    { "subject": "subject name", "hours_this_week": <number, sum of study block durations for this subject> }
+  ]
+}
+
+This is the COMPACT tier: always return "" for every "focus_summary" and "note" field \
+exactly as shown above — do not fill them in, even briefly. Keep "activity" short (a few \
+words). The per-block "energy" field still needs to vary realistically (see the energy \
+rule below) — that reasoning should drive your placement of blocks, just don't write it \
+out in "note".
+
+Rules:
+"""
+LOW_SYSTEM_PROMPT = _INTRO_AND_PRINCIPLES + "\n" + _LOW_JSON_SHAPE + _COMMON_RULES
+
+SYSTEM_PROMPT_BY_EFFORT = {
+    "low": LOW_SYSTEM_PROMPT,
+    "medium": MEDIUM_SYSTEM_PROMPT,
+    "high": HIGH_SYSTEM_PROMPT,
+}
+
+# Kept for anything importing the old name directly — same text as before (= "high").
+SYSTEM_PROMPT = HIGH_SYSTEM_PROMPT
 
 
 def _extract_json(raw_text):
@@ -137,11 +256,18 @@ def _build_user_prompt(subjects, exams_or_deadlines, lifestyle_answers):
     return "\n".join(lines)
 
 
-def generate_schedule(subjects, exams_or_deadlines, lifestyle_answers):
+def generate_schedule(subjects, exams_or_deadlines, lifestyle_answers, effort=None, user_api_key=None):
     """
     subjects: list of dicts from syllabus_structurer.py's "subjects" field (can be empty list)
     exams_or_deadlines: list of dicts from syllabus_structurer.py (can be empty list)
     lifestyle_answers: dict from chat_handler.get_collected_answers()
+    effort: "low" | "medium" | "high" (Task 7's effort selector). Anything else
+            (None, unrecognised) falls back to "medium" — the previous, single-tier
+            behavior, just with the raised max_tokens.
+    user_api_key: optional caller-supplied Anthropic key (Task 8, BYO Claude key).
+            When present, this call goes to Claude instead of Groq, using the model
+            tier CLAUDE_MODEL_BY_EFFORT[effort] maps to. Never stored here — passed
+            straight through to llm_client.ask() for this one call only.
 
     Returns:
       {
@@ -157,16 +283,28 @@ def generate_schedule(subjects, exams_or_deadlines, lifestyle_answers):
         "error": str  (if not success)
       }
     """
+    effort = effort if effort in SYSTEM_PROMPT_BY_EFFORT else DEFAULT_EFFORT
+    system_prompt = SYSTEM_PROMPT_BY_EFFORT[effort]
+
+    if user_api_key:
+        model = CLAUDE_MODEL_BY_EFFORT[effort]
+        max_tokens = CLAUDE_MAX_TOKENS_BY_EFFORT[effort]
+    else:
+        model = None  # unused for Groq
+        max_tokens = GROQ_MAX_TOKENS_BY_EFFORT[effort]
+
     user_prompt = _build_user_prompt(subjects, exams_or_deadlines, lifestyle_answers)
 
     conversation = [{"role": "user", "content": user_prompt}]
 
     try:
-        reply, _, _ = ask(
-            system_prompt=SYSTEM_PROMPT,
+        reply, _, out_tok = ask(
+            system_prompt=system_prompt,
             conversation_history=conversation,
             provider=PROVIDER,
-            max_tokens=3000
+            max_tokens=max_tokens,
+            user_api_key=user_api_key,
+            model=model
         )
     except Exception as e:
         logger.error(f"Schedule generation LLM call failed: {e}")
@@ -183,7 +321,17 @@ def generate_schedule(subjects, exams_or_deadlines, lifestyle_answers):
         cleaned = _extract_json(reply)
         parsed = json.loads(cleaned)
     except json.JSONDecodeError as e:
-        logger.error(f"Schedule generator returned invalid JSON: {e}\nRaw reply: {reply[:500]}")
+        # Task 7(c): tell a truncated response (hit max_tokens mid-JSON, the Task 7
+        # root cause) apart from a genuinely malformed one in the LOG ONLY — the
+        # user-facing error/UI below is unchanged from Task 5/6, on purpose.
+        if out_tok is not None and out_tok >= max_tokens - 5:
+            logger.error(
+                f"Schedule generator JSON truncated at token limit "
+                f"(effort={effort}, out_tok={out_tok}, max_tokens={max_tokens}): {e}\n"
+                f"Raw reply (last 300 chars): {reply[-300:]}"
+            )
+        else:
+            logger.error(f"Schedule generator returned malformed JSON: {e}\nRaw reply: {reply[:500]}")
         return {
             "success": False,
             "error": "Got an unreadable response while building your schedule. Try again.",
@@ -208,7 +356,7 @@ def generate_schedule(subjects, exams_or_deadlines, lifestyle_answers):
             "subject_breakdown": None
         }
 
-    logger.info(f"Generated schedule covering {len(schedule)} days")
+    logger.info(f"Generated schedule covering {len(schedule)} days (effort={effort})")
     return {
         "success": True,
         "schedule": schedule,
