@@ -269,6 +269,22 @@ function initByok() {
 }
 
 /* ===== Chat page ===== */
+// Mobile keyboards: iOS doesn't shrink 100dvh when the keyboard opens, so the chat is sized to the visual viewport instead.
+function trackViewport(onChange) {
+  const vv = window.visualViewport;
+  if (!vv) return;
+  const sync = () => {
+    if (vv.scale > 1.01) return; // pinch-zoomed: leave the layout alone
+    document.documentElement.style.setProperty('--vvh', vv.height + 'px');
+    document.body.classList.toggle('kb-open', window.innerHeight - vv.height > 140);
+    if (vv.offsetTop) window.scrollTo(0, 0); // iOS pans the page to reveal the input; the chat already fits, so undo it
+    if (onChange) onChange();
+  };
+  vv.addEventListener('resize', sync);
+  vv.addEventListener('scroll', sync);
+  sync();
+}
+
 function initChat() {
   const box = $('messages'), input = $('input'), sendBtn = $('send');
   $('attach').innerHTML = ICON.clip;
@@ -286,6 +302,8 @@ function initChat() {
   }
 
   const scroll = () => box.scrollTo({ top: box.scrollHeight, behavior: 'smooth' });
+  trackViewport(() => box.scrollTo({ top: box.scrollHeight }));
+  input.addEventListener('focus', () => setTimeout(scroll, 300));
 
   function addRow(role, node) {
     const row = document.createElement('div');

@@ -258,3 +258,44 @@ select:focus-visible,.byok input:focus-visible,.composer textarea:focus-visible{
   @keyframes toastIn{from{opacity:0;transform:translate(-50%,12px)}}
 }
 @media (prefers-reduced-motion:reduce){.stage .day,.nav-arrow{transition:none}}
+
+/* ---------- mobile (additive: desktop rules above are untouched) ---------- */
+a,button,summary,select{-webkit-tap-highlight-color:transparent}
+a,button,summary,select,input,textarea{touch-action:manipulation}
+.hint-touch{display:none}
+@media (pointer:coarse){select,.byok input,.composer textarea{font-size:1rem}} /* 16px stops iOS zooming into the field */
+@media (hover:none){
+  .btn:hover{transform:none;filter:none}
+  .btn:active{transform:scale(.97)}
+  .week-tools p{display:none}
+}
+/* chat fills the screen on phones and landscape phones, and follows the keyboard (--vvh is set in script.js) */
+@media (max-width:560px),(max-height:520px){
+  body.chat-page{display:flex;flex-direction:column;height:var(--vvh,100dvh);min-height:0;overflow:hidden}
+  .chat-page .nav{flex:none;min-height:56px}
+  .chat-page main.wrap{display:flex;flex:1;flex-direction:column;width:100%;min-height:0;margin:0}
+  .chat-page .chat-panel{flex:1;height:auto;min-height:0;max-width:none;border-width:1px 0 0;border-radius:var(--r-xl) var(--r-xl) 0 0}
+  .chat-page .chat-head{padding:12px 16px}
+  .chat-page .chat-head h1{font-size:1.5rem}
+  .chat-page .messages{padding:16px 14px}
+  .chat-page .composer{padding-bottom:12px}
+  .chat-page .hint{flex:none;margin:8px auto calc(8px + env(safe-area-inset-bottom,0px));font-size:.8125rem}
+  .hint-desk{display:none}
+  .hint-touch{display:inline}
+  .kb-open .hint{display:none}
+}
+@media (max-width:560px){
+  .results-head{gap:16px;padding-block:16px 20px}
+  .streak-wrap{width:100%}
+  .streak-wrap .checkin{flex:1}
+  .view-tabs{display:flex;width:100%}
+  .view-tabs button{flex:1;min-height:44px;padding:0 8px}
+  .reasoning{gap:12px;padding:16px}
+  .notice{padding:14px 16px}
+  .week-tools .btn{width:100%}
+  .stat-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+  .stat-card,.chart-card,.heatmap-card{padding:16px}
+  .stat-value{font-size:2.25rem}
+  .donut-wrap{justify-content:center}
+  .heatmap-card{margin-bottom:40px}
+}

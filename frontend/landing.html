@@ -34,9 +34,15 @@
       <a href="#team">Team</a>
       <a href="#faq">FAQ</a>
     </nav>
-    <a class="btn btn--primary btn--sm" href="chat.html">Build my schedule</a>
+    <a class="btn btn--primary btn--sm nav__cta" href="chat.html">Build my schedule</a>
+    <button class="nav__menu" type="button" aria-expanded="false" aria-controls="menu" aria-label="Open menu"><span></span><span></span></button>
   </div>
 </header>
+
+<div class="menu" id="menu" hidden>
+  <nav class="menu__links" aria-label="Menu"><a href="#how">How it works</a><a href="#features">Features</a><a href="#stack">Under the hood</a><a href="#team">Team</a><a href="#faq">FAQ</a></nav>
+  <a class="btn btn--primary" href="chat.html">Build my schedule</a>
+</div>
 
 <main id="main">
   <section class="wrap hero">
