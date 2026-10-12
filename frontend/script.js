@@ -66,7 +66,7 @@ function authHeaders() {
 }
 
 /* ===== API (mocked until backend exists) ===== */
-const GREETING = "Hi! I'm BioSync. Let's build your week. What college or university do you attend?";
+const GREETING = "Hi! I'm BioSync. Let's build your week. What courses are you taking this term?";
 const MOCK_REPLIES = [
   "Nice. Any exams or big deadlines coming up in the next few weeks?",
   "When do you focus best: morning, afternoon, or late evening?",
@@ -88,11 +88,7 @@ async function sendMessage(text) {
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
     body: JSON.stringify({ message: text })
   });
-  if (!res.ok) {
-    const err = new Error('chat ' + res.status);
-    if (res.status < 500) err.userMessage = (await res.json().catch(() => ({}))).error;
-    throw err;
-  }
+  if (!res.ok) throw new Error('chat ' + res.status);
   const data = await res.json();
   // data.reply = the AI's text response to show
   // data.done = true once enough info is collected
@@ -104,11 +100,7 @@ async function uploadFile(file) {
   const formData = new FormData();
   formData.append('file', file);
   const res = await fetch('/api/upload', { method: 'POST', body: formData });
-  if (!res.ok) {
-    const body = res.status < 500 ? await res.json().catch(() => null) : null;
-    if (body && body.error) return { status: 'failed', error: body.error };
-    throw new Error('upload ' + res.status);
-  }
+  if (!res.ok) throw new Error('upload ' + res.status);
   return await res.json(); // { status: "received" }
 }
 
@@ -363,7 +355,7 @@ function initChat() {
       if (data.done) { finished = true; showDone(); }
     } catch (e) {
       typing.remove();
-      addMsg('ai', e.userMessage || "I couldn't reach the server. Check your connection and send that again.");
+      addMsg('ai', "I couldn't reach the server. Check your connection and send that again.");
     }
     setBusy(false); if (!finished) input.focus();
   }
@@ -927,9 +919,6 @@ function showResults(data) {
   if (!Array.isArray(data) && data.status === 'failed') { showScheduleFailure(data); return; }
 
   const schedule = Array.isArray(data) ? data : (data.schedule || []);
-  if (!Array.isArray(data) && data.warnings && data.warnings.length) {
-    $('resultsNotice').replaceChildren(makeNotice('example', 'Heads up', data.warnings.join(' '), []));
-  }
   if (!schedule.length) {
     $('resultsBody').innerHTML = '<p class="state">No schedule yet. <a href="chat.html">Chat with BioSync</a> to build one.</p>';
     return;

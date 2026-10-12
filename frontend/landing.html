@@ -56,7 +56,7 @@
       <ul class="proof">
         <li>Reads PDF, Word, Excel and photos</li>
         <li>7 questions in chat</li>
-        <li>No account needed</li>
+        <li>Free to try</li>
       </ul>
     </div>
 
@@ -173,9 +173,9 @@
     <div class="card providers">
       <h3>Which AI runs this</h3>
       <div class="providers__cols">
-        <p><b>Gemini (Google AI), default.</b> Runs on the server's shared key. If the AI service is busy, the schedule page says so and offers a retry.</p>
-        <p><b>Claude (Anthropic).</b> Optional. Paste your own key on the chat page to use it, and the detail level picks Haiku, Sonnet or Opus.</p>
-        <p><b>Your own key.</b> Optional: paste a free Gemini key from <a href="https://aistudio.google.com" target="_blank" rel="noopener">AI Studio</a> on the chat page, so you never depend on the shared one.</p>
+        <p><b>Groq, free tier (default).</b> Fast, but rate-limited when busy. If it fails, the schedule page says so and offers a retry.</p>
+        <p><b>Claude (Anthropic).</b> Optional. Paste your own key on the chat page to use it.</p>
+        <p><b>Gemini (Google AI).</b> Optional, with a much higher free token limit. Needs a free <a href="https://aistudio.google.com" target="_blank" rel="noopener">AI Studio</a> key.</p>
       </div>
     </div>
   </section>
@@ -195,7 +195,7 @@
     <div class="faq">
       <details><summary>Does BioSync store my data?</summary><p>Sessions live in server memory with no database, so a restart clears them. A key you paste is kept in your browser tab only and sent with your own requests.</p></details>
       <details><summary>How accurate is document reading?</summary><p>Text PDFs, Word and Excel files read reliably. Photos use OCR, which can miss messy handwriting. A scanned PDF with no text layer may come back empty.</p></details>
-      <details><summary>Why would a schedule fail to generate?</summary><p>Usually the AI service is rate-limited or briefly down. You get a clear message and a retry, or you can paste your own Gemini or Claude key.</p></details>
+      <details><summary>Why would a schedule fail to generate?</summary><p>The default Groq free tier has a token-per-minute limit. You get a clear message and a retry, or you can switch to your own Claude or Gemini key.</p></details>
       <details><summary>Is this medical advice?</summary><p>No. It uses general patterns like chronotype and the post-lunch dip from your answers. It does not measure your sleep or health.</p></details>
     </div>
   </section>
