@@ -1,382 +1,588 @@
 """
-app.py — Flask glue between the frontend and the four pipeline stages.
+app.py
+Flask backend: the glue between the frontend (landing.html / chat.html /
+results.html with script.js) and the four pipeline scripts.
 
-API contract (unchanged for the frontend; every field below is additive-only):
-  POST /api/chat           {"message"}            -> {"reply", "done"}
-  POST /api/upload         multipart field "file" -> {"status": "received"|"failed", "error"?}
-  POST /api/effort         {"level"}              -> {"status": "ok", "level"}
-  GET  /api/schedule       -> {"status": "pending"|"ready"|"failed", "schedule", "reasoning_notes",
-                               "weekly_focus_hours", "subject_breakdown", "error", "reason", "warnings"}
-  POST /api/schedule/retry -> same shape; re-runs only if the last attempt failed
-  GET  /healthz            -> {"status": "ok"}
-`reason` (when failed): rate_limited | invalid_api_key | not_configured |
-generation_failed | internal_error. A failed schedule is still HTTP 200.
-Other 4xx/5xx are JSON {"error": "..."}; 429 carries Retry-After.
+Routes. The first five keep the exact shapes script.js was already written
+against; everything marked NEW only adds fields or endpoints.
 
-BYO keys: optional X-Anthropic-Api-Key / X-Gemini-Api-Key headers are read per
-request, format-checked, passed down as plain arguments and never stored or
-logged. A malformed key is rejected (400) rather than silently ignored, so a
-student's typo can never quietly fall back to the shared server key.
+  POST /api/chat           {"message"}                  -> {"reply", "done"}
+                           NEW fields: step, total, schedule_status, notice
+  POST /api/upload         multipart, field "file"      -> {"status": "received" | "failed", "error"?}
+                           NEW fields: filename, note
+  GET  /api/schedule                                    -> {"status", "schedule", "reasoning_notes",
+                                                           "weekly_focus_hours", "subject_breakdown", "error", "reason"}
+                           NEW: status may be "generating" (+ progress), plus warnings, meta, retry_after_s
+  POST /api/schedule/retry                              -> same shape as GET /api/schedule
+                           NEW: returns at once with "generating"; the page polls
+  POST /api/effort         {"level": low|medium|high}   -> {"status": "ok", "level"}
 
-State: sessions live in memory (see SETUP.md for why that is the right call
-today). Run ONE gunicorn worker with threads; each session has its own lock so
-double-clicks cannot advance the checklist twice or run the pipeline twice.
+  NEW  GET  /api/health        liveness probe (Render's health check)
+  NEW  GET  /api/config        limits, greeting and which provider the server can use
+  NEW  GET  /api/chat/state    redraw the chat after a refresh
+  NEW  POST /api/key/test      one tiny real call proving a pasted key works
+  NEW  POST /api/reset         start over
+
+Keys: a student's own key travels per request in X-Gemini-Api-Key or
+X-Anthropic-Api-Key (if both arrive, Claude wins, as it always has). Otherwise the
+server's GEMINI_API_KEY / ANTHROPIC_API_KEY is used if the operator set one; with
+neither, the schedule step fails with reason "no_key". A key is read from the
+request, passed down as an argument and never stored in a session, a log line or a
+response.
+
+Errors: every /api error is {"error": "<student-safe sentence>", "reason": "<code>"}.
+
+Sessions: one dict per browser in server memory (sessions.py explains why that is a
+deliberate MVP decision), with idle expiry, a size cap, per-session and per-IP rate
+limits, and one build at a time per student.
+
+To run locally:
+  1. cd backend && cp .env.example .env     (the defaults work; add a key if you like)
+  2. pip install -r requirements.txt
+  3. python app.py                           then open http://localhost:5000
 """
 
+from __future__ import annotations
+
+import copy
 import logging
 import os
-import re
 import secrets
+import tempfile
 import threading
 import time
 import uuid
-from collections import defaultdict, deque
-from functools import wraps
+from datetime import timedelta
+from pathlib import Path
 
 from dotenv import load_dotenv
-from flask import Flask, jsonify, request, send_from_directory, session
-from werkzeug.exceptions import HTTPException
-from werkzeug.middleware.proxy_fix import ProxyFix
 
 load_dotenv()
 
-import chat_handler  # noqa: E402  (after load_dotenv so env is populated)
+from flask import Flask, jsonify, request, send_from_directory, session  # noqa: E402
+from werkzeug.exceptions import HTTPException, MethodNotAllowed, NotFound  # noqa: E402
+from werkzeug.middleware.proxy_fix import ProxyFix  # noqa: E402
+
+import chat_handler  # noqa: E402
 import document_parser  # noqa: E402
-import schedule_generator  # noqa: E402
-import syllabus_structurer  # noqa: E402
+import llm_client  # noqa: E402
+import pipeline  # noqa: E402
+from sessions import RateLimiter, Session, SessionStore  # noqa: E402
 
-logger = logging.getLogger(__name__)
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(),
+                    format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+for noisy in ("httpx", "httpcore", "google_genai", "google.genai", "anthropic", "urllib3", "PIL", "pdfminer"):
+    logging.getLogger(noisy).setLevel(logging.WARNING)
+logger = logging.getLogger("biosync")
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
-MAX_UPLOAD_MB = 20  # keep in sync with MAX_MB in frontend/script.js
-MAX_DOCS_PER_SESSION = 8
-SESSION_TTL_S = 6 * 3600
-MAX_SESSIONS = 2000
-
-APP_ENV = os.getenv("APP_ENV", "production").strip().lower()
-IS_PROD = APP_ENV == "production"
+APP_VERSION = "1.0.0"
+START_TIME = time.time()
 
 
-def resolve_secret(app_env, key):
-    """Production must have a real secret; dev gets a random per-process one (never a guessable constant)."""
-    key = (key or "").strip()
-    if app_env == "production":
-        if len(key) < 16 or key.startswith("change-this"):
+def _env_int(name: str, default: int, minimum: int = 1) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return max(minimum, int(raw))
+    except ValueError:
+        logger.warning("%s=%r is not a whole number; using %d", name, raw, default)
+        return default
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.getenv(name, "").strip().lower()
+    return default if not raw else raw in ("1", "true", "yes", "on")
+
+
+IS_PRODUCTION = os.getenv("APP_ENV", "").strip().lower() == "production" or bool(os.getenv("RENDER"))
+FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
+MAX_UPLOAD_MB = _env_int("MAX_UPLOAD_MB", 20)
+MAX_FILES = _env_int("MAX_FILES", 10)
+MAX_JSON_BYTES = 64 * 1024
+MAX_CONCURRENT_PARSES = _env_int("MAX_CONCURRENT_PARSES", 2)
+
+# ---------------------------------------------------------------------------
+# App, secret key, cookies
+# ---------------------------------------------------------------------------
+_WEAK_SECRETS = {"", "dev-only-key-change-this", "change-me", "changeme", "replace-me", "secret", "your-secret-key"}
+
+
+def _load_secret_key() -> str:
+    """The signing key for the session cookie. Production refuses to start without a real one."""
+    key = os.getenv("FLASK_SECRET_KEY", "").strip()
+    if key.lower() in _WEAK_SECRETS or len(key) < 16:
+        if IS_PRODUCTION:
             raise RuntimeError(
-                "FLASK_SECRET_KEY is missing or a placeholder (APP_ENV=production). Generate one with: "
-                'python -c "import secrets; print(secrets.token_hex(32))"'
-            )
-        return key
-    return key or secrets.token_hex(32)
+                "FLASK_SECRET_KEY is missing or too weak. Set it to a long random value, e.g. "
+                "`python -c \"import secrets; print(secrets.token_hex(32))\"` (render.yaml generates one for you).")
+        logger.warning("FLASK_SECRET_KEY is not set: using a random key for this run, so sessions reset on restart.")
+        return secrets.token_hex(32)
+    return key
 
 
-app = Flask(__name__, static_folder=os.path.join(BASE_DIR, "..", "frontend"), static_url_path="")
-app.secret_key = resolve_secret(APP_ENV, os.getenv("FLASK_SECRET_KEY"))
+app = Flask(__name__, static_folder=None)
+app.secret_key = _load_secret_key()
 app.config.update(
-    MAX_CONTENT_LENGTH=(MAX_UPLOAD_MB + 1) * 1024 * 1024,  # hard cap on any request body, enforced before parsing
+    MAX_CONTENT_LENGTH=(MAX_UPLOAD_MB + 1) * 1024 * 1024,   # the hard ceiling for any request body
+    SESSION_COOKIE_NAME="biosync_session",
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
-    # Explicit opt-in: a Secure cookie is never sent over plain http, which would break local Docker runs.
-    SESSION_COOKIE_SECURE=os.getenv("COOKIE_SECURE", "0") == "1",
+    SESSION_COOKIE_SECURE=IS_PRODUCTION,
+    PERMANENT_SESSION_LIFETIME=timedelta(hours=12),
 )
-_hops = int(os.getenv("TRUSTED_PROXY_HOPS", "0"))
-if _hops:  # only trust X-Forwarded-* when a known proxy (e.g. Render) sits in front
-    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=_hops, x_proto=_hops)
+app.json.ensure_ascii = False
+app.json.sort_keys = False
 
-os.makedirs(UPLOAD_DIR, exist_ok=True)
+if _env_flag("TRUST_PROXY", bool(os.getenv("RENDER"))):
+    # Behind Render's proxy the client IP and scheme arrive in X-Forwarded-* headers.
+    # Trusted only when asked for: otherwise anyone could fake their IP and dodge the rate limits.
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 
+STORE = SessionStore(ttl_seconds=_env_int("SESSION_TTL_MINUTES", 360, 5) * 60,
+                     max_sessions=_env_int("MAX_SESSIONS", 1000, 10))
+RATE = RateLimiter()
+_PARSE_SLOTS = threading.BoundedSemaphore(MAX_CONCURRENT_PARSES)
 
-# ---------------------------------------------------------------- sessions
-class SessionStore:
-    """In-memory sessions with a TTL and a hard cap, so memory cannot grow without bound."""
+# bucket: (hits allowed per session, hits allowed per IP) in RATE_WINDOW_S seconds.
+# The per-IP number is deliberately generous: a whole campus can share one address.
+RATE_WINDOW_S = 600
+LIMITS = {
+    "chat": (40, 400),
+    "upload": (15, 150),
+    "job": (6, 60),
+    "key_test": (12, 120),
+    "poll": (900, 3000),
+    "reset": (10, 100),
+}
 
-    def __init__(self, ttl, cap):
-        self._d, self._lock, self._ttl, self._cap, self._pruned = {}, threading.Lock(), ttl, cap, time.time()
-
-    @staticmethod
-    def _new():
-        return {"chat_state": None, "parsed_docs": [], "structured_data": None, "structured_n": -1,
-                "schedule": None, "effort": "medium", "warnings": [], "lock": threading.RLock(), "seen": time.time()}
-
-    def get(self, sid, create=True):
-        now = time.time()
-        with self._lock:
-            if now - self._pruned > 60:
-                self._d = {k: v for k, v in self._d.items() if now - v["seen"] < self._ttl}
-                self._pruned = now
-            s = self._d.get(sid)
-            if s is None and create:
-                if len(self._d) >= self._cap:  # evict the least recently used
-                    self._d.pop(min(self._d, key=lambda k: self._d[k]["seen"]))
-                s = self._d[sid] = self._new()
-            if s:
-                s["seen"] = now
-            return s
-
-
-store = SessionStore(SESSION_TTL_S, MAX_SESSIONS)
-
-
-def _sdata(create=True):
-    if "session_id" not in session:
-        if not create:
-            return None
-        session["session_id"] = uuid.uuid4().hex
-    return store.get(session["session_id"], create=create)
+CSP = "; ".join([
+    "default-src 'self'",
+    "script-src 'self'",
+    "style-src 'self' https://fonts.googleapis.com",
+    "font-src https://fonts.gstatic.com",
+    "img-src 'self' data:",
+    "connect-src 'self'",
+    "base-uri 'self'",
+    "form-action 'self'",
+    "frame-ancestors 'none'",
+    "object-src 'none'",
+])
 
 
-# ---------------------------------------------------------------- rate limiting
-class RateLimiter:
-    """Sliding window per (bucket, client IP). Plenty for one instance; swap for Redis if you ever scale out."""
-
-    def __init__(self):
-        self.enabled, self._hits, self._lock = True, defaultdict(deque), threading.Lock()
-
-    def retry_after(self, bucket, ip, limit, window):
-        if not self.enabled:
-            return 0
-        now = time.monotonic()
-        with self._lock:
-            q = self._hits[(bucket, ip)]
-            while q and now - q[0] > window:
-                q.popleft()
-            if len(q) >= limit:
-                return int(window - (now - q[0])) + 1
-            q.append(now)
-            if len(self._hits) > 5000:
-                self._hits = defaultdict(deque, {k: v for k, v in self._hits.items() if v})
-        return 0
+# ---------------------------------------------------------------------------
+# Errors: one JSON envelope for everything under /api
+# ---------------------------------------------------------------------------
+class ApiError(Exception):
+    def __init__(self, status: int, reason: str, message: str, **extra):
+        super().__init__(message)
+        self.status, self.reason, self.message, self.extra = status, reason, message, extra
 
 
-limiter = RateLimiter()
+def _error_response(status: int, reason: str, message: str, **extra):
+    body = {"error": message, "reason": reason, **extra}
+    response = jsonify(body)
+    response.status_code = status
+    if extra.get("retry_after_s"):
+        response.headers["Retry-After"] = str(extra["retry_after_s"])
+    return response
 
 
-def rate_limited(bucket, limit, window=60):
-    def deco(fn):
-        @wraps(fn)
-        def wrapper(*a, **kw):
-            wait = limiter.retry_after(bucket, request.remote_addr or "?", limit, window)
-            if wait:
-                return jsonify({"error": f"You're going a little fast. Wait {wait} seconds and try again."}), 429, {"Retry-After": str(wait)}
-            return fn(*a, **kw)
-        return wrapper
-    return deco
+@app.errorhandler(ApiError)
+def _on_api_error(exc: ApiError):
+    return _error_response(exc.status, exc.reason, exc.message, **exc.extra)
 
 
-# ---------------------------------------------------------------- BYO keys
-_KEY_RE = re.compile(r"[A-Za-z0-9_\-]{20,300}")
-
-
-class BadKey(ValueError):
-    pass
-
-
-def _byok():
-    """(anthropic_key, gemini_key) from this request's headers. Raises BadKey on a malformed value."""
-    keys = []
-    for header in ("X-Anthropic-Api-Key", "X-Gemini-Api-Key"):
-        value = (request.headers.get(header) or "").strip()
-        if value and not _KEY_RE.fullmatch(value):
-            raise BadKey()
-        keys.append(value or None)
-    return keys
-
-
-# ---------------------------------------------------------------- errors & headers
-@app.errorhandler(BadKey)
-def bad_key(_):
-    return jsonify({"error": "That API key doesn't look valid. Check it, or turn off 'Use my own AI API key'."}), 400
-
-
-@app.errorhandler(HTTPException)
-def http_error(e):
-    if not request.path.startswith("/api/"):
-        return e
-    msg = f"That file is over {MAX_UPLOAD_MB} MB. Upload a smaller file." if e.code == 413 else e.description
-    body = {"error": msg}
-    if request.path == "/api/upload":
-        body["status"] = "failed"
-    return jsonify(body), e.code
-
-
-@app.errorhandler(Exception)
-def unhandled(e):
-    logger.exception("Unhandled error on %s", request.path)
-    if request.path.startswith("/api/"):
-        return jsonify({"error": "Something went wrong on the server. Please try again."}), 500
-    return "Something went wrong.", 500
-
-
-@app.after_request
-def security_headers(resp):
-    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
-    resp.headers.setdefault("X-Frame-Options", "DENY")
-    resp.headers.setdefault("Referrer-Policy", "same-origin")
-    return resp
-
-
-# ---------------------------------------------------------------- pages
-@app.route("/")
-def serve_landing():
-    return send_from_directory(app.static_folder, "landing.html")
-
-
-@app.route("/healthz")
-def healthz():
-    return jsonify({"status": "ok"})
-
-
-@app.route("/<path:filename>")
-def serve_static(filename):
-    return send_from_directory(app.static_folder, filename)
-
-
-# ---------------------------------------------------------------- pipeline
-SCHEDULE_ERROR_MESSAGES = {
-    "rate_limited": "The AI service hit its rate limit. Wait a minute, then try again.",
-    "invalid_api_key": "The AI provider rejected the API key. Check the key you pasted, or turn off 'Use my own AI API key'.",
-    "not_configured": "This server has no AI key configured. Set GEMINI_API_KEY or ANTHROPIC_API_KEY, or paste your own key on the chat page.",
-    "generation_failed": "The AI service couldn't build your schedule this time. Try again shortly.",
-    "internal_error": "Something went wrong on our side while building your schedule. Try again shortly.",
+_HTTP_MESSAGES = {
+    400: ("bad_request", "That request wasn't valid."),
+    404: ("not_found", "That page or endpoint doesn't exist."),
+    405: ("method_not_allowed", "That request used the wrong method."),
+    413: ("too_large", "That request is too large."),
+    415: ("bad_request", "That request wasn't valid."),
 }
 
 
-def _run_pipeline(sdata, user_key, gemini_key):
-    """Structure uploaded docs (if any), then build the schedule. Never raises; failures are stored as results."""
+@app.errorhandler(HTTPException)
+def _on_http_error(exc: HTTPException):
+    if not request.path.startswith("/api/"):
+        return exc  # the normal page for 404s and friends
+    reason, message = _HTTP_MESSAGES.get(exc.code or 500, ("http_error", "Something went wrong with that request."))
+    if exc.code == 413 and request.path == "/api/upload":
+        message = f"That file is too large. The limit is {MAX_UPLOAD_MB} MB."
+    return _error_response(exc.code or 500, reason, message)
+
+
+@app.errorhandler(Exception)
+def _on_unhandled(exc: Exception):
+    logger.exception("Unhandled error on %s %s", request.method, request.path)
+    if request.path.startswith("/api/"):
+        return _error_response(500, "internal_error", "Something went wrong on our side. Please try again.")
+    return "Something went wrong. Please try again.", 500
+
+
+# ---------------------------------------------------------------------------
+# Request plumbing
+# ---------------------------------------------------------------------------
+@app.before_request
+def _before():
+    request.environ["biosync.t0"] = time.monotonic()
+    if request.path.startswith("/api/") and request.path != "/api/upload":
+        request.max_content_length = MAX_JSON_BYTES  # chat messages and settings are small; uploads are not
+
+
+@app.after_request
+def _after(response):
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("Referrer-Policy", "same-origin")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+    response.headers.setdefault("Content-Security-Policy", CSP)
+    if IS_PRODUCTION:
+        response.headers.setdefault("Strict-Transport-Security", "max-age=31536000")
+    if request.path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store"
+        if request.path not in ("/api/health", "/api/schedule"):  # polls would drown the log
+            ms = int((time.monotonic() - request.environ.get("biosync.t0", time.monotonic())) * 1000)
+            logger.info("%s %s -> %s %dms sid=%s", request.method, request.path, response.status_code, ms,
+                        str(session.get("sid", "-"))[:8])
+    return response
+
+
+def _sid() -> str:
+    sid = session.get("sid")
+    if not isinstance(sid, str) or len(sid) != 32:
+        sid = uuid.uuid4().hex
+        session["sid"] = sid
+        session.permanent = True
+    return sid
+
+
+def current_session() -> Session:
+    return STORE.get(_sid())
+
+
+def read_json() -> dict:
+    data = request.get_json(silent=True)
+    return data if isinstance(data, dict) else {}
+
+
+def enforce_limit(bucket: str) -> None:
+    """Raise a 429 when this browser (or this address) is going too fast for `bucket`."""
+    per_session, per_ip = LIMITS[bucket]
+    allowed, retry = RATE.hit(f"{bucket}:s:{_sid()}", per_session, RATE_WINDOW_S)
+    if allowed:
+        allowed, retry = RATE.hit(f"{bucket}:ip:{request.remote_addr or '-'}", per_ip, RATE_WINDOW_S)
+    if not allowed:
+        raise ApiError(429, "too_many_requests",
+                       f"You're going a little fast. Try again in {retry} seconds.", retry_after_s=retry)
+
+
+def request_credentials() -> tuple[llm_client.Credentials | None, llm_client.LLMError | None]:
+    """
+    The API key for THIS request: a key the student pasted (headers), else the server's own.
+    Returns (creds, None), or (None, why) when there is no usable key. The key is only ever
+    held in local variables of the request that carries it.
+    """
     try:
-        raw = [d["text"] for d in sdata["parsed_docs"] if d.get("success")]
-        sdata["warnings"] = []
-        subjects, deadlines = [], []
-        if raw:
-            if sdata["structured_n"] != len(raw):  # reuse a good structuring result across retries
-                sdata["structured_data"] = syllabus_structurer.structure_documents(raw, user_key, gemini_key)
-                sdata["structured_n"] = len(raw) if sdata["structured_data"]["success"] else -1
-            structured = sdata["structured_data"]
-            if structured["success"]:
-                subjects, deadlines = structured["data"]["subjects"], structured["data"]["exams_or_deadlines"]
-            else:
-                sdata["warnings"].append("We couldn't read your uploaded files, so this schedule is built from your chat answers only.")
-        sdata["schedule"] = schedule_generator.generate_schedule(
-            subjects, deadlines, chat_handler.get_collected_answers(sdata["chat_state"]),
-            effort=sdata["effort"], user_api_key=user_key, user_gemini_api_key=gemini_key,
-        )
-    except Exception:  # noqa: BLE001 — anything unexpected becomes a failed schedule, not a 500
-        logger.exception("Pipeline crashed")
-        sdata["schedule"] = {"success": False, "reason": "internal_error"}
+        return llm_client.resolve_credentials(request.headers.get("X-Anthropic-Api-Key"),
+                                              request.headers.get("X-Gemini-Api-Key")), None
+    except llm_client.LLMError as err:
+        return None, err
 
 
-def _schedule_payload(sdata):
-    payload = {"status": "pending", "schedule": [], "reasoning_notes": "", "weekly_focus_hours": None,
-               "subject_breakdown": [], "error": None, "reason": None, "warnings": []}
-    result = sdata.get("schedule") if sdata else None
+# Reasons worth interrupting the chat for: the student can fix them right now.
+_NOTICE_REASONS = {"no_key", "bad_key", "region_blocked", "quota_exhausted", "rate_limited", "model_unavailable"}
+
+
+def notice_for(err: llm_client.LLMError | None) -> dict | None:
+    if err is None or err.reason not in _NOTICE_REASONS:
+        return None
+    return {"reason": err.reason, "message": err.message}
+
+
+def _schedule_status(sess: Session) -> str:
+    """pending | generating | ready | failed. Caller need not hold the lock (single reads)."""
+    job, result = sess.job, sess.schedule
+    if job is not None and job.status == "generating":
+        return "generating"
     if result is None:
-        return payload
-    if not result.get("success"):
-        reason = result.get("reason") if result.get("reason") in SCHEDULE_ERROR_MESSAGES else "generation_failed"
-        payload.update(status="failed", reason=reason, error=SCHEDULE_ERROR_MESSAGES[reason])
-        return payload
-    payload.update(status="ready", schedule=result["schedule"], reasoning_notes=result["reasoning_notes"],
-                   weekly_focus_hours=result["weekly_focus_hours"], subject_breakdown=result["subject_breakdown"],
-                   warnings=sdata["warnings"])
-    return payload
+        return "pending"
+    return "ready" if result.get("success") else "failed"
 
 
-# ---------------------------------------------------------------- API
-@app.route("/api/chat", methods=["POST"])
-@rate_limited("chat", 30)
-def api_chat():
-    data = request.get_json(silent=True)
-    message = str((data or {}).get("message") or "").strip() if isinstance(data, dict) else ""
-    if not message:
-        return jsonify({"error": "Could you type something first?", "reply": "Could you type something first?", "done": False}), 400
-    if len(message) > chat_handler.MAX_MESSAGE_CHARS:
-        err = f"That's a long one. Keep it under {chat_handler.MAX_MESSAGE_CHARS} characters."
-        return jsonify({"error": err, "reply": err, "done": False}), 400
-    user_key, gemini_key = _byok()
-
-    sdata = _sdata()
-    with sdata["lock"]:
-        if chat_handler.is_complete(sdata["chat_state"]):
-            # Chat is over: never re-run the pipeline (that would burn the student's quota on a double-click).
-            return jsonify({"reply": "Your schedule is ready. Open it from 'My schedule'.", "done": True})
-        if sdata["chat_state"] is None:
-            sdata["chat_state"] = chat_handler._new_session_state()
-        reply, done, sdata["chat_state"] = chat_handler.handle_message(
-            sdata["chat_state"], message, user_api_key=user_key, user_gemini_api_key=gemini_key)
-        if done:
-            _run_pipeline(sdata, user_key, gemini_key)
-    return jsonify({"reply": reply, "done": done})
+# ---------------------------------------------------------------------------
+# Static frontend
+# ---------------------------------------------------------------------------
+@app.get("/")
+def serve_landing():
+    return send_from_directory(FRONTEND_DIR, "landing.html")
 
 
-@app.route("/api/effort", methods=["POST"])
-@rate_limited("effort", 30)
+@app.get("/<path:filename>")
+def serve_static(filename: str):
+    if filename.startswith("api/"):
+        # An API path answers in JSON, never with a page: 405 if it exists for another method, else 404.
+        try:
+            app.url_map.bind_to_environ(request.environ).match("/" + filename, method="POST")
+        except HTTPException:
+            raise NotFound() from None
+        raise MethodNotAllowed(valid_methods=["POST"])
+    return send_from_directory(FRONTEND_DIR, filename)
+
+
+# ---------------------------------------------------------------------------
+# Small endpoints
+# ---------------------------------------------------------------------------
+@app.get("/api/health")
+def api_health():
+    return jsonify(status="ok", version=APP_VERSION, uptime_s=int(time.time() - START_TIME))
+
+
+@app.get("/api/config")
+def api_config():
+    return jsonify({
+        "version": APP_VERSION,
+        "total_questions": chat_handler.TOTAL_QUESTIONS,
+        "greeting": chat_handler.get_greeting(),
+        "max_message_chars": chat_handler.MAX_ANSWER_CHARS,
+        "max_upload_mb": MAX_UPLOAD_MB,
+        "max_files": MAX_FILES,
+        "allowed_extensions": sorted(document_parser.SUPPORTED_EXTENSIONS),
+        "efforts": list(llm_client.EFFORTS),
+        "server_llm": llm_client.server_llm_info(),
+        "providers": [
+            {"id": llm_client.GEMINI, "label": llm_client.PROVIDER_LABEL[llm_client.GEMINI],
+             "key_url": "https://aistudio.google.com/apikey", "key_hint": llm_client.KEY_HINT[llm_client.GEMINI]},
+            {"id": llm_client.CLAUDE, "label": llm_client.PROVIDER_LABEL[llm_client.CLAUDE],
+             "key_url": "https://console.anthropic.com/settings/keys", "key_hint": llm_client.KEY_HINT[llm_client.CLAUDE]},
+        ],
+    })
+
+
+@app.post("/api/effort")
 def api_effort():
-    data = request.get_json(silent=True)
-    level = str((data or {}).get("level") or "").strip().lower() if isinstance(data, dict) else ""
-    if level not in ("low", "medium", "high"):
-        return jsonify({"error": "level must be 'low', 'medium', or 'high'."}), 400
-    _sdata()["effort"] = level
+    level = str(read_json().get("level") or "").strip().lower()
+    if level not in llm_client.EFFORTS:
+        raise ApiError(400, "bad_request", "level must be 'low', 'medium', or 'high'.")
+    sess = current_session()
+    with sess.lock:
+        sess.effort = level
     return jsonify({"status": "ok", "level": level})
 
 
-def _upload_fail(msg, code=200):
-    # 200 for user-fixable problems: script.js reads the "status" field for these.
-    return jsonify({"status": "failed", "error": msg}), code
-
-
-@app.route("/api/upload", methods=["POST"])
-@rate_limited("upload", 10)
-def api_upload():
-    f = request.files.get("file")
-    if f is None or not f.filename:
-        return _upload_fail("No file received.", 400)
-    ext = document_parser.get_extension(f.filename)
-    if ext not in document_parser.SUPPORTED_EXTENSIONS:
-        return _upload_fail(f"Unsupported file type: .{ext}", 400)
-    sdata = _sdata()
-    if len(sdata["parsed_docs"]) >= MAX_DOCS_PER_SESSION:
-        return _upload_fail(f"You've added {MAX_DOCS_PER_SESSION} files already, which is the limit.")
-
-    path = os.path.join(UPLOAD_DIR, f"{uuid.uuid4().hex}.{ext}")  # server-chosen name; the client's is never used on disk
+@app.post("/api/key/test")
+def api_key_test():
+    """Prove a key works with one tiny real call, so a typo is caught before the 7 questions, not after."""
+    enforce_limit("key_test")
+    creds, issue = request_credentials()
+    if creds is None:
+        err = issue or llm_client.LLMError("no_key")
+        return jsonify(ok=False, reason=err.reason, message=err.message)
     try:
-        f.save(path)
-        if os.path.getsize(path) > MAX_UPLOAD_MB * 1024 * 1024:
-            return _upload_fail(f"That file is over {MAX_UPLOAD_MB} MB. Upload a smaller file.", 413)
-        with open(path, "rb") as fh:
-            if not document_parser.looks_like(ext, fh.read(16)):
-                return _upload_fail(f"This doesn't look like a real .{ext} file. Check it opens on your device.")
-        result = document_parser.parse_document(path, original_filename=f.filename)
+        result = llm_client.check_credentials(creds)
+    except llm_client.LLMError as err:
+        logger.info("key test failed: provider=%s reason=%s", creds.provider, err.reason)
+        return jsonify(ok=False, reason=err.reason, message=err.message, provider=creds.provider,
+                       retry_after_s=err.retry_after)
+    logger.info("key test ok: provider=%s model=%s source=%s %dms", creds.provider, result.model, creds.source,
+                result.latency_ms)
+    return jsonify(ok=True, provider=creds.provider, model=result.model, latency_ms=result.latency_ms,
+                   source=creds.source)
+
+
+@app.post("/api/reset")
+def api_reset():
+    enforce_limit("reset")
+    STORE.reset(_sid())
+    return jsonify(status="ok")
+
+
+# ---------------------------------------------------------------------------
+# Chat
+# ---------------------------------------------------------------------------
+@app.get("/api/chat/state")
+def api_chat_state():
+    sess = current_session()
+    with sess.lock:
+        state = sess.chat_state
+        return jsonify({
+            **chat_handler.progress(state),
+            "done": chat_handler.is_complete(state),
+            "greeting": chat_handler.get_greeting(),
+            "messages": chat_handler.public_transcript(state),
+            "effort": sess.effort,
+            "documents": [{"name": d.get("source_filename"), "status": "received" if d.get("success") else "failed",
+                           "error": d.get("error"), "note": d.get("note")} for d in sess.parsed_docs],
+            "schedule_status": _schedule_status(sess),
+        })
+
+
+@app.post("/api/chat")
+def api_chat():
+    enforce_limit("chat")
+    message = str(read_json().get("message") or "").strip()
+    if not message:
+        return jsonify({"reply": chat_handler.EMPTY_REPLY, "done": False, "error": chat_handler.EMPTY_REPLY,
+                        "reason": "empty_message"}), 400
+
+    sess = current_session()
+    creds, key_issue = request_credentials()
+
+    # A double-tap or a second tab must not advance the checklist twice.
+    if not sess.chat_lock.acquire(blocking=False):
+        raise ApiError(409, "busy", "One moment, I'm still working on your last message.")
+    try:
+        with sess.lock:
+            state = copy.deepcopy(sess.chat_state) if sess.chat_state else chat_handler.new_session_state()
+            was_done = chat_handler.is_complete(state)
+        # The AI call happens here, with no lock held, so polling stays responsive.
+        turn = chat_handler.handle_message(state, message, creds)
+        with sess.lock:
+            sess.chat_state = turn.state
+        if turn.done and not was_done:
+            # Never let the build crash the final chat reply: it runs in the background and reports
+            # its own failure through /api/schedule.
+            pipeline.start_job(sess, creds, missing=key_issue)
     finally:
-        try:
-            os.remove(path)  # we keep only the extracted text, never the original
-        except OSError:
-            pass
+        sess.chat_lock.release()
 
-    with sdata["lock"]:
-        sdata["parsed_docs"].append(result.to_dict())
-    return jsonify({"status": "received"}) if result.success else _upload_fail(result.error)
+    payload = {"reply": turn.reply, "done": turn.done, **chat_handler.progress(turn.state),
+               "schedule_status": _schedule_status(sess)}
+    notice = notice_for(key_issue or turn.llm_issue)
+    if notice:
+        payload["notice"] = notice
+    return jsonify(payload)
 
 
-@app.route("/api/schedule", methods=["GET"])
+# ---------------------------------------------------------------------------
+# Upload
+# ---------------------------------------------------------------------------
+@app.post("/api/upload")
+def api_upload():
+    enforce_limit("upload")
+    if "file" not in request.files:
+        return jsonify({"status": "failed", "error": "No file received."}), 400
+    file = request.files["file"]
+    original_filename = file.filename or ""
+    if original_filename == "":
+        return jsonify({"status": "failed", "error": "Empty filename."}), 400
+    ext = document_parser.get_extension(original_filename)
+    if ext not in document_parser.SUPPORTED_EXTENSIONS:
+        return jsonify({"status": "failed", "error": f"Unsupported file type: .{ext}"}), 400
+
+    sess = current_session()
+    with sess.lock:
+        if len(sess.parsed_docs) >= MAX_FILES:
+            return jsonify({"status": "failed",
+                            "error": f"That's the limit of {MAX_FILES} files. Start over to change them."}), 400
+
+    if not _PARSE_SLOTS.acquire(timeout=30):
+        return jsonify({"status": "failed", "error": "BioSync is busy reading other files. Try again in a moment."}), 503
+    try:
+        # A private temporary folder per request: the file gets a name we chose (never the student's),
+        # and it is deleted when the block ends, whether or not parsing worked.
+        with tempfile.TemporaryDirectory(prefix="biosync-") as tmp:
+            save_path = os.path.join(tmp, f"upload.{ext}")
+            file.save(save_path)
+            result = document_parser.parse_document(save_path, original_filename=original_filename)
+    finally:
+        _PARSE_SLOTS.release()
+
+    with sess.lock:
+        sess.parsed_docs.append(result.to_dict())
+
+    if result.success:
+        body = {"status": "received", "filename": result.source_filename}
+        if result.note:
+            body["note"] = result.note
+        return jsonify(body)
+    # 200 on purpose: script.js checks the "status" field in the body for this failure case.
+    return jsonify({"status": "failed", "error": result.error, "filename": result.source_filename}), 200
+
+
+# ---------------------------------------------------------------------------
+# Schedule
+# GET /api/schedule always answers HTTP 200: the signal is in the body, so a proxy in
+# front of the app cannot swallow it the way it could a 429/502/503 error page.
+#
+#   status "pending"     the chat isn't finished, nothing has been built yet
+#   status "generating"  the build is running (progress: {stage, elapsed_s})
+#   status "ready"       schedule, reasoning_notes, weekly_focus_hours, subject_breakdown,
+#                        warnings (things to know) and meta (provider, model, effort)
+#   status "failed"      error (a sentence for the student) + reason (a stable code) and,
+#                        for rate limits, retry_after_s
+# The provider's raw error text is only logged, never sent to the browser.
+# ---------------------------------------------------------------------------
+def schedule_payload(sess: Session) -> dict:
+    with sess.lock:
+        payload = {
+            "status": "pending", "schedule": [], "reasoning_notes": "", "weekly_focus_hours": None,
+            "subject_breakdown": [], "error": None, "reason": None,
+        }
+        job, result = sess.job, sess.schedule
+        if job is not None and job.status == "generating":
+            payload.update(status="generating", progress=pipeline.job_progress(job))
+            return payload
+        if result is None:
+            return payload
+        payload["warnings"] = list(result.get("warnings") or [])
+        if not result.get("success"):
+            reason = result.get("reason") or "generation_failed"
+            provider = (result.get("meta") or {}).get("provider")
+            payload.update(status="failed", reason=reason,
+                           error=result.get("error") or llm_client.public_message(reason, provider),
+                           provider=provider, retry_after_s=result.get("retry_after_s"))
+            return payload
+        payload.update(
+            status="ready",
+            schedule=result["schedule"],
+            reasoning_notes=result.get("reasoning_notes") or "",
+            weekly_focus_hours=result.get("weekly_focus_hours"),
+            subject_breakdown=result.get("subject_breakdown") or [],
+            meta=result.get("meta") or {},
+        )
+        return payload
+
+
+@app.get("/api/schedule")
 def api_schedule():
-    return jsonify(_schedule_payload(_sdata(create=False)))
+    enforce_limit("poll")
+    return jsonify(schedule_payload(current_session()))
 
 
-@app.route("/api/schedule/retry", methods=["POST"])
-@rate_limited("retry", 6)
+@app.post("/api/schedule/retry")
 def api_schedule_retry():
-    user_key, gemini_key = _byok()
-    sdata = _sdata()
-    with sdata["lock"]:  # a concurrent retry waits here, then sees the fresh result and does nothing
-        result = sdata["schedule"]
-        failed = result is None or not result.get("success")
-        if chat_handler.is_complete(sdata["chat_state"]) and failed:
-            _run_pipeline(sdata, user_key, gemini_key)
-    return jsonify(_schedule_payload(sdata))
+    """
+    After a failed build the chat is already finished, so without this the only way to
+    retry would be to redo the whole chat. Starts a new build only if the chat is complete
+    and the last attempt did not produce a schedule: never while one is running, never
+    over a good one. Returns at once; the page polls GET /api/schedule.
+    """
+    enforce_limit("job")
+    sess = current_session()
+    creds, key_issue = request_credentials()
+    with sess.lock:
+        chat_done = chat_handler.is_complete(sess.chat_state)
+        can_retry = chat_done and (sess.job is None or sess.job.status == "failed")
+    if can_retry:
+        pipeline.start_job(sess, creds, missing=key_issue)
+    return jsonify(schedule_payload(sess))
 
 
 if __name__ == "__main__":
-    # Local dev server. Production uses gunicorn (see Dockerfile); debug is never allowed in production.
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)),
-            debug=(os.getenv("FLASK_DEBUG", "").lower() == "true" and not IS_PROD))
+    # Render (and most PaaS hosts) inject the port to bind via the PORT env var; 5000 for local dev.
+    # debug is off unless asked for, and never in production: the Werkzeug debugger exposes a
+    # remote shell on a public URL.
+    port = _env_int("PORT", 5000)
+    debug_mode = _env_flag("FLASK_DEBUG", False) and not IS_PRODUCTION
+    info = llm_client.server_llm_info()
+    logger.info("BioSync %s starting on :%d (env=%s). Server AI key: %s", APP_VERSION, port,
+                "production" if IS_PRODUCTION else "development",
+                f"{info['provider']} (students may still use their own)" if info["available"]
+                else "none, so every student pastes their own Gemini or Claude key")
+    app.run(host="0.0.0.0", port=port, debug=debug_mode)
+else:
+    _info = llm_client.server_llm_info()
+    logger.info("BioSync %s ready (env=%s). Server AI key: %s", APP_VERSION,
+                "production" if IS_PRODUCTION else "development",
+                f"{_info['provider']}" if _info["available"] else "none (students bring their own)")
