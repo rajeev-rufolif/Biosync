@@ -27,6 +27,17 @@ import pytesseract
 
 logger = logging.getLogger(__name__)
 
+MAX_PDF_PAGES = 40          # bounds CPU time on a hostile or huge PDF
+MAX_SHEET_ROWS = 5000       # same, per Excel sheet
+MAX_TEXT_CHARS = 30000      # per document; keeps session memory and prompt size bounded
+OCR_TIMEOUT_S = 30
+
+# Leading bytes of each allowed type: an upload named .pdf must start like a PDF.
+_MAGIC = {
+    "pdf": (b"%PDF",), "docx": (b"PK",), "xlsx": (b"PK",), "xls": (b"PK", b"\xd0\xcf\x11\xe0"),
+    "doc": (b"\xd0\xcf\x11\xe0",), "png": (b"\x89PNG",), "jpg": (b"\xff\xd8\xff",), "jpeg": (b"\xff\xd8\xff",),
+}
+
 SUPPORTED_EXTENSIONS = {"pdf", "doc", "docx", "xls", "xlsx", "png", "jpg", "jpeg", "webp"}
 
 
@@ -47,6 +58,13 @@ class ParseResult:
         }
 
 
+def looks_like(ext, head):
+    """True if the first bytes of a file match its claimed extension (webp = RIFF....WEBP)."""
+    if ext == "webp":
+        return head[:4] == b"RIFF" and head[8:12] == b"WEBP"
+    return any(head.startswith(m) for m in _MAGIC.get(ext, ()))
+
+
 def get_extension(filename):
     return filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
 
@@ -61,7 +79,7 @@ def parse_pdf(filepath):
     """
     text_parts = []
     with pdfplumber.open(filepath) as pdf:
-        for page in pdf.pages:
+        for page in pdf.pages[:MAX_PDF_PAGES]:
             page_text = page.extract_text()
             if page_text:
                 text_parts.append(page_text)
@@ -84,12 +102,12 @@ def parse_docx(filepath):
 
 def parse_xlsx(filepath):
     """Extract text from an Excel file — every sheet, every non-empty row."""
-    workbook = openpyxl.load_workbook(filepath, data_only=True)
+    workbook = openpyxl.load_workbook(filepath, data_only=True, read_only=True)
     text_parts = []
 
     for sheet in workbook.worksheets:
         text_parts.append(f"[Sheet: {sheet.title}]")
-        for row in sheet.iter_rows(values_only=True):
+        for row in sheet.iter_rows(max_row=MAX_SHEET_ROWS, values_only=True):
             row_values = [str(cell) for cell in row if cell is not None]
             if row_values:
                 text_parts.append(" | ".join(row_values))
@@ -122,7 +140,7 @@ def parse_xls(filepath):
 
     for sheet in workbook.sheets():
         text_parts.append(f"[Sheet: {sheet.name}]")
-        for row_idx in range(sheet.nrows):
+        for row_idx in range(min(sheet.nrows, MAX_SHEET_ROWS)):
             row_values = []
             for cell in sheet.row(row_idx):
                 if cell.ctype in (xlrd.XL_CELL_EMPTY, xlrd.XL_CELL_BLANK):
@@ -148,9 +166,8 @@ def parse_xls(filepath):
 
 def parse_image(filepath):
     """OCR an image file using pytesseract."""
-    image = Image.open(filepath)
-    text = pytesseract.image_to_string(image)
-    return text.strip()
+    with Image.open(filepath) as image:
+        return pytesseract.image_to_string(image, timeout=OCR_TIMEOUT_S).strip()
 
 
 def parse_document(filepath, original_filename=None):
@@ -197,12 +214,17 @@ def parse_document(filepath, original_filename=None):
             )
 
         logger.info(f"Parsed {display_name} ({ext}) — {len(text)} chars extracted")
-        return ParseResult(success=True, text=text, source_filename=display_name)
+        return ParseResult(success=True, text=text[:MAX_TEXT_CHARS], source_filename=display_name)
 
     except Exception as e:
-        logger.error(f"Failed to parse {display_name}: {e}")
+        # Log the real cause; show a user-safe message (never raw library text).
+        logger.error(f"Failed to parse {display_name}: {type(e).__name__}: {e}")
+        if isinstance(e, pytesseract.TesseractNotFoundError):
+            msg = "Reading photos isn't available on this server right now. Upload a PDF, Word, or Excel file instead."
+        else:
+            msg = "Couldn't read this file. It may be corrupted, password-protected, or not what its extension says."
         return ParseResult(
             success=False,
-            error=f"Couldn't read this file: {str(e)}",
+            error=msg,
             source_filename=display_name
         )

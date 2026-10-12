@@ -1,26 +1,22 @@
 """
-chat_handler.py
-Script 1 of 4 in the pipeline.
+chat_handler.py — stage 1 of the pipeline (LLM).
 
-Job: talk to the student, work through a FIXED checklist of questions,
-and signal when enough information has been collected. This is deliberately
-a fixed checklist (not "let the AI decide when it's done") — predictable
-flow, easier to demo reliably, and the user can always still type freely;
-we just always know which question we're on.
+Walks the student through a FIXED checklist, one question at a time. The LLM
+only phrases the next question warmly; the order, the stored answers and the
+"done" signal are plain code, so the flow is predictable. Chat always uses the
+cheapest model tier (it is a one-sentence reply), regardless of schedule detail.
 
-Provider: Groq by default (fast, free, this runs on every single message
-so cost/speed matters more than peak reasoning quality here). Can be
-switched to Claude via provider="claude" in ask_chat(), or by setting
-DEFAULT_LLM_PROVIDER=claude in .env. Gemini is supported the same way
-(provider="gemini" / DEFAULT_LLM_PROVIDER=gemini), and via BYO key — see
-user_gemini_api_key below.
-
-This module holds per-session chat state in memory (a dict). No database —
-if the Flask process restarts, in-progress conversations are lost. That's
-an accepted MVP tradeoff, noted in the README.
+State is a plain dict held by app.py's session store (in memory; lost on
+restart by design — see SETUP.md).
 """
 
-from llm_client import ask, CLAUDE_MODEL_BY_EFFORT, GEMINI_MODEL_BY_EFFORT
+import logging
+
+from llm_client import LLMError, ask
+
+logger = logging.getLogger(__name__)
+
+MAX_MESSAGE_CHARS = 1500  # also enforced server-side in app.py; bounds prompt size and quota burn
 
 # ---- The fixed checklist ----
 # Each step has: the field name we're collecting, and the exact question
@@ -36,8 +32,6 @@ CHECKLIST = [
     {"field": "focus_pattern", "question": "When do you focus best — morning, afternoon, or late at night? And roughly how many hours a day can you realistically study?"},
     {"field": "extra_notes", "question": "Anything else you think I should know while building your schedule? (Deadlines, exams, commitments, anything at all — or just say 'no' to skip.)"},
 ]
-
-PROVIDER = "groq"  # change to "claude" here to use Claude for chat instead
 
 SYSTEM_PROMPT_TEMPLATE = """You are BioSync, a friendly AI assistant that helps students build a \
 personalized weekly time-management schedule. You are warm, concise, and conversational — \
@@ -80,87 +74,48 @@ def get_greeting():
     )
 
 
-def handle_message(session_state, user_message, user_api_key=None, user_gemini_api_key=None, effort="medium"):
+def handle_message(session_state, user_message, user_api_key=None, user_gemini_api_key=None):
     """
-    Process one incoming user message for this session.
+    Process one user message. Returns (reply_text, done, session_state).
 
-    session_state: dict from _new_session_state() (or an existing one for this session)
-    user_message: the text the student just sent
-    user_api_key: optional caller-supplied Anthropic key (Task 8, BYO Claude key) —
-        read fresh from the request by app.py each call, never stored in
-        session_state. When present, this turn's reply comes from Claude (model
-        tier picked by `effort`) instead of the shared Groq key.
-    user_gemini_api_key: optional caller-supplied Gemini key (Task 8b, BYO Gemini
-        key), same pattern as user_api_key above. When present (and
-        user_api_key is not), this turn's reply comes from Gemini (model tier
-        picked by `effort` via GEMINI_MODEL_BY_EFFORT) instead of the shared
-        Groq key.
-    effort: "low" | "medium" | "high" (Task 7's effort selector) — only changes
-        anything here when user_api_key or user_gemini_api_key is also set,
-        since it picks the Claude/Gemini model tier. Groq's chat replies are
-        short (max_tokens=200) regardless of effort; that was never the
-        overflow problem, so the Groq path here is intentionally left as-is.
-
-    Returns: (reply_text, done_bool, updated_session_state)
+    A reply shorter than 2 characters is not accepted as an answer: the same
+    question is asked again and the step does not advance. If the LLM call
+    fails, the plain checklist question is used so the student is never stuck.
+    BYO keys are used for this call only and never stored.
     """
     if session_state is None:
         session_state = _new_session_state()
 
     step = session_state["step"]
-    session_state["history"].append({"role": "user", "content": user_message})
-
-    # If we've already finished the checklist, just acknowledge — app.py
-    # should stop routing here and move to document parsing / schedule gen.
     if step >= len(CHECKLIST):
         session_state["done"] = True
-        return (
-            "Thanks, that's everything I need. Your schedule is ready.",
-            True,
-            session_state
-        )
+        return "Thanks, that's everything I need. Your schedule is ready.", True, session_state
 
+    text = user_message.strip()
     current = CHECKLIST[step]
+    if len(text) < 2:
+        return f"Could you say a little more? {current['question']}", False, session_state
 
-    # Record the raw answer to the field we were just asking about.
-    # (Simple approach for MVP: whatever the student just said IS the answer
-    # to the current question. A stretch improvement would be a second AI
-    # call to validate/extract the answer cleanly, but that's unnecessary
-    # complexity for a first working version.)
-    session_state["answers"][current["field"]] = user_message
+    session_state["history"].append({"role": "user", "content": text})
+    session_state["answers"][current["field"]] = text
+    session_state["step"] = step + 1
 
-    # Move to the next step
-    next_step = step + 1
-    session_state["step"] = next_step
-
-    if next_step >= len(CHECKLIST):
-        # Just answered the last question — wrap up, no new question to ask.
+    if session_state["step"] >= len(CHECKLIST):
         session_state["done"] = True
-        reply = (
-            "Thanks, that's everything I need. I've got a full picture of your "
-            "courses and routine — your schedule is ready."
-        )
+        reply = ("Thanks, that's everything I need. I've got a full picture of your "
+                 "courses and routine, so your schedule is ready.")
         session_state["history"].append({"role": "assistant", "content": reply})
         return reply, True, session_state
 
-    next_question = CHECKLIST[next_step]["question"]
-    system_prompt = SYSTEM_PROMPT_TEMPLATE.format(current_question=next_question)
-
+    next_question = CHECKLIST[session_state["step"]]["question"]
     try:
-        claude_model = CLAUDE_MODEL_BY_EFFORT.get(effort) if user_api_key else None
-        gemini_model = GEMINI_MODEL_BY_EFFORT.get(effort) if user_gemini_api_key else None
-        reply, _, _ = ask(
-            system_prompt=system_prompt,
-            conversation_history=session_state["history"],
-            provider=PROVIDER,
-            max_tokens=200,
-            user_api_key=user_api_key,
-            user_gemini_api_key=user_gemini_api_key,
-            model=claude_model or gemini_model
-        )
-    except Exception:
-        # Fallback: if the LLM call fails for any reason (bad key, rate limit,
-        # network), still move the conversation forward with the raw question
-        # rather than leaving the student stuck.
+        reply = ask(
+            SYSTEM_PROMPT_TEMPLATE.format(current_question=next_question),
+            session_state["history"], max_tokens=200, effort="low",
+            user_api_key=user_api_key, user_gemini_api_key=user_gemini_api_key,
+        ).text.strip() or next_question
+    except LLMError as exc:
+        logger.warning("Chat LLM unavailable (%s); using the plain checklist question.", exc.reason)
         reply = next_question
 
     session_state["history"].append({"role": "assistant", "content": reply})

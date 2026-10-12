@@ -1,258 +1,185 @@
 """
-llm_client.py
-Shared multi-provider LLM client — Claude, Groq, or Gemini, chosen per call.
+llm_client.py — the ONLY module that talks to an LLM provider.
 
-Why this exists as its own file: chat_handler.py, syllabus_structurer.py,
-and schedule_generator.py all need to call an LLM. Instead of each script
-repeating client setup, error handling, and logging, they all import from
-here. One place to fix bugs, one place to swap models.
+Providers: Gemini (Google AI Studio key) and Claude (Anthropic key). Groq was
+removed: its free-tier tokens-per-minute cap truncated schedules mid-JSON.
 
-Provider selection: each script passes its own `provider` argument
-("claude", "groq", or "gemini") when it calls ask(). Today all three callers
-(chat_handler, syllabus_structurer, schedule_generator) pass "groq" — Groq's
-free tier needs a GROQ_API_KEY. Claude is supported as an alternate provider
-(needs ANTHROPIC_API_KEY); flip any single script to it by changing that
-script's PROVIDER constant — one line each.
+Which key is used, in order:
+  1. a caller-supplied BYO key (per request, never stored or logged) —
+     Claude wins if both are given;
+  2. LLM_PROVIDER from the environment, if that provider's server key is set;
+  3. the first server key that exists (GEMINI_API_KEY, then ANTHROPIC_API_KEY).
+If none exists, ask() raises LLMError("not_configured") — it never guesses.
 
-Gemini (added alongside Claude): Google's Gemini API free tier (needs a
-GEMINI_API_KEY from https://aistudio.google.com — NOT the same thing as a
-consumer Gemini app subscription, which has no API key at all). Its free-tier
-TPM ceiling is far above Groq's, which is the actual fix for Groq cutting the
-schedule-generation response off mid-JSON. Same BYO-key pattern as Claude
-(see below) via user_gemini_api_key, and the same per-script PROVIDER
-one-liner ("gemini") to make it the default for a given step.
-
-BYO-key path (Task 8, extended): a caller can pass `user_api_key` (Claude) or
-`user_gemini_api_key` (Gemini) to ask(). Whichever is present overrides the
-provider arg above entirely — the call always goes to that provider, using
-the caller-supplied key via a fresh, one-off client (see create_client's
-api_key_override). If both are somehow present, Claude wins (keeps existing
-Task 8 behavior unchanged for anyone already using it). This never touches
-ANTHROPIC_API_KEY/GEMINI_API_KEY, SESSIONS, or any server-side storage; see
-app.py for where these keys are read from the request and
-chat_handler.py/schedule_generator.py for how they're threaded through.
+Every failure surfaces as LLMError(reason) with reason in REASONS, so callers
+and the API can show an honest, user-safe message instead of a raw SDK error.
 """
 
-import os
-import sys
+import json
 import logging
-import anthropic
-import groq
-from google import genai
-from google.genai import types as genai_types
+import os
+import random
+import re
+import sys
+import time
+from dataclasses import dataclass
+
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# Log to stdout, NOT to a file. This is the first basicConfig() to run in the
-# process (app.py imports this module before its own basicConfig call, which
-# is then a no-op), so this config applies app-wide. A file inside the
-# container is invisible to Render's Logs tab (which only captures
-# stdout/stderr) and is wiped on every redeploy.
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    stream=sys.stdout
-)
+# stdout, not a file: Render's Logs tab only captures stdout/stderr.
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s", stream=sys.stdout)
 logger = logging.getLogger(__name__)
 
-# Model names — change here if you want a different model, nowhere else.
-CLAUDE_MODEL = "claude-haiku-4-5-20251001"
-GROQ_MODEL = "openai/gpt-oss-120b"
-GEMINI_MODEL = "gemini-2.5-flash"  # free-tier eligible; see GEMINI_MODEL_BY_EFFORT below
-
-# Added for the BYO-Claude-key feature: a user who brings their own Anthropic key
-# picks a model tier via the SAME Low/Medium/High effort selector used for the
-# shared Groq path (see schedule_generator.py / chat_handler.py), instead of a
-# second "pick your model" control. CLAUDE_MODEL (Haiku, above) is reused as-is
-# for "low" — it was already the only Claude model in this file. These two are
-# new; verified against Anthropic's current model listing before hardcoding.
-CLAUDE_MODEL_SONNET = "claude-sonnet-5-5"
-CLAUDE_MODEL_OPUS = "claude-opus-5-5"
-
+# Model IDs live here and nowhere else. Google retires Gemini models on a fixed
+# schedule (gemini-2.5-flash is scheduled to shut down 2026-10-16), so the
+# Gemini ID is overridable without a code change: set GEMINI_MODEL.
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash").strip()
 CLAUDE_MODEL_BY_EFFORT = {
-    "low": CLAUDE_MODEL,
-    "medium": CLAUDE_MODEL_SONNET,
-    "high": CLAUDE_MODEL_OPUS,
+    "low": "claude-haiku-4-5-20251001",
+    "medium": "claude-sonnet-5-5",
+    "high": "claude-opus-5-5",
 }
 
-# Claude's paid API has a far higher per-response ceiling than Groq's free tier
-# (which is what Task 7 hit at a self-imposed max_tokens=3000). These numbers are
-# deliberately NOT a reuse of the Groq tiers' 3000/5000 — the whole point of the
-# BYO-key path is removing that ceiling, so each tier gets real headroom.
-CLAUDE_MAX_TOKENS_BY_EFFORT = {"low": 4000, "medium": 8000, "high": 16000}
+# Output-token ceiling for the schedule call. A 7-day schedule is ~70-90 blocks
+# at ~50 tokens each (~4-5k tokens) and Gemini's thinking tokens count against
+# this limit too, so even "low" needs real headroom. You only pay for tokens
+# actually generated; the ceiling just stops a good answer being cut off.
+MAX_TOKENS_BY_EFFORT = {"low": 6000, "medium": 10000, "high": 16000}
+EFFORTS = tuple(MAX_TOKENS_BY_EFFORT)
 
-# Gemini mirrors the Claude BYO-key pattern: same Low/Medium/High effort
-# selector, its own model tier and max_tokens ceiling. Flash is used at every
-# tier (not Pro) because, as of the free-tier changes through mid-2026, Flash
-# is the model Google actually keeps on the free tier with real TPM headroom —
-# Pro's free allowance is minimal/trial-only and would defeat the point of
-# using this path for free. If a paid Gemini key is ever used, Pro can be
-# swapped in per-tier the same way Claude's tiers step up models.
-GEMINI_MODEL_FLASH = "gemini-2.5-flash"
-GEMINI_MODEL_BY_EFFORT = {
-    "low": GEMINI_MODEL_FLASH,
-    "medium": GEMINI_MODEL_FLASH,
-    "high": GEMINI_MODEL_FLASH,
-}
-# Gemini's free-tier TPM (~250,000) is far above Groq's (~8,000 on gpt-oss-120b),
-# which is the actual bottleneck Groq was hitting — these ceilings are generous
-# per-call budgets, not an attempt to approach the TPM limit in one request.
-GEMINI_MAX_TOKENS_BY_EFFORT = {"low": 3000, "medium": 6000, "high": 10000}
-
-DEFAULT_PROVIDER = os.getenv("DEFAULT_LLM_PROVIDER", "groq").strip().lower()
+REQUEST_TIMEOUT_S = 60
+RETRY_DELAY_S = 2.0
+REASONS = ("rate_limited", "invalid_api_key", "not_configured", "generation_failed")
 
 
-def create_client(provider, api_key_override=None):
-    """
-    Create and return an API client for 'claude', 'groq', or 'gemini'.
+class LLMError(Exception):
+    """reason: one of REASONS. truncated: the reply hit the token ceiling."""
 
-    api_key_override: used only by a BYO-key path (provider="claude" or
-    provider="gemini") — when present, builds the client from this
-    caller-supplied key instead of the shared ANTHROPIC_API_KEY/GEMINI_API_KEY
-    env var. Never logged. This function always returns a brand-new client
-    (there is no module-level/cached client here), so a BYO-key call and the
-    shared-key path never share a client instance.
-    """
-    if provider == "claude":
-        api_key = api_key_override or os.getenv("ANTHROPIC_API_KEY")
-        if not api_key:
-            raise ValueError(
-                "ANTHROPIC_API_KEY missing. Add it to your .env file, "
-                "or switch this call to provider='groq' if you don't have a Claude key."
-            )
-        client = anthropic.Anthropic(api_key=api_key)
-        logger.info("Anthropic client created" + (" (user-supplied key)" if api_key_override else ""))
-        return client
-
-    elif provider == "groq":
-        api_key = os.getenv("GROQ_API_KEY")
-        if not api_key:
-            raise ValueError("GROQ_API_KEY missing. Add it to your .env file.")
-        client = groq.Groq(api_key=api_key)
-        logger.info("Groq client created")
-        return client
-
-    elif provider == "gemini":
-        api_key = api_key_override or os.getenv("GEMINI_API_KEY")
-        if not api_key:
-            raise ValueError(
-                "GEMINI_API_KEY missing. Get a free key at https://aistudio.google.com "
-                "and add it to your .env file, or switch this call to provider='groq' "
-                "if you don't have a Gemini key. Note: a consumer Gemini app subscription "
-                "(e.g. via Jio's Google AI Pro bundle) does NOT include an API key — "
-                "this must be a separate key from Google AI Studio."
-            )
-        client = genai.Client(api_key=api_key)
-        logger.info("Gemini client created" + (" (user-supplied key)" if api_key_override else ""))
-        return client
-
-    else:
-        raise ValueError(f"Unknown provider '{provider}'. Use 'claude', 'groq', or 'gemini'.")
+    def __init__(self, reason, message="", truncated=False):
+        super().__init__(message or reason)
+        self.reason = reason
+        self.truncated = truncated
 
 
-def _gemini_contents(conversation_history):
-    """
-    Converts the shared {"role": "user"|"assistant", "content": "..."} history
-    shape into Gemini's expected contents list. Gemini uses "model" where
-    Claude/Groq (OpenAI-style) use "assistant" — everything else carries over
-    as-is, since system_prompt is passed separately via GenerateContentConfig's
-    system_instruction, not folded into this list (same split Claude uses).
-    """
-    role_map = {"user": "user", "assistant": "model"}
-    return [
-        {"role": role_map.get(turn["role"], turn["role"]), "parts": [{"text": turn["content"]}]}
-        for turn in conversation_history
-    ]
+@dataclass
+class LLMReply:
+    text: str
+    in_tokens: int = 0
+    out_tokens: int = 0
+    truncated: bool = False
 
 
-def ask(system_prompt, conversation_history, provider=None, max_tokens=1024,
-        user_api_key=None, user_gemini_api_key=None, model=None):
-    """
-    Send a conversation to the chosen LLM and get back the full reply (no streaming —
-    this is a web backend, not a CLI, so we wait for the full response and return it).
-
-    conversation_history: list of {"role": "user"|"assistant", "content": "..."}
-    provider: "claude", "groq", or "gemini". If None, uses DEFAULT_LLM_PROVIDER from
-              .env (defaults to groq). Ignored when user_api_key or
-              user_gemini_api_key is given (see below).
-    user_api_key: optional caller-supplied Anthropic API key (BYO-key feature, Task 8).
-              When present, this call ALWAYS goes to Claude, using a fresh client built
-              from this key only (never the shared ANTHROPIC_API_KEY, never cached —
-              `client` here is a local variable that goes out of scope when this
-              function returns, so nothing about this key outlives this one call). The
-              key itself is never written to a log line by this function; callers
-              must not store it anywhere either. Takes precedence over
-              user_gemini_api_key if both are somehow passed, so any existing Task 8
-              caller is unaffected by this parameter's addition.
-    user_gemini_api_key: optional caller-supplied Gemini API key (BYO-key feature,
-              same pattern as user_api_key above, mirrored for Gemini). When present
-              (and user_api_key is not), this call ALWAYS goes to Gemini, using a
-              fresh client built from this key only. Same never-stored,
-              never-logged guarantee as user_api_key.
-    model: explicit model ID to use when provider is (or becomes) "claude" or
-              "gemini" — e.g. one of CLAUDE_MODEL_BY_EFFORT's or
-              GEMINI_MODEL_BY_EFFORT's values. Falls back to CLAUDE_MODEL /
-              GEMINI_MODEL respectively.
-
-    Returns: (reply_text, input_tokens, output_tokens)
-    Raises: ValueError (bad/missing key), or the underlying API exception on failure —
-            callers are expected to catch these and return a friendly error to the user.
-    """
+def resolve_provider(user_api_key=None, user_gemini_api_key=None):
+    """Pick the provider for one call (see module docstring for the order)."""
     if user_api_key:
-        provider = "claude"
-        client = create_client("claude", api_key_override=user_api_key)
-    elif user_gemini_api_key:
-        provider = "gemini"
-        client = create_client("gemini", api_key_override=user_gemini_api_key)
-    else:
-        provider = (provider or DEFAULT_PROVIDER).strip().lower()
-        client = create_client(provider)
+        return "claude"
+    if user_gemini_api_key:
+        return "gemini"
+    have = {"gemini": bool(os.getenv("GEMINI_API_KEY")), "claude": bool(os.getenv("ANTHROPIC_API_KEY"))}
+    preferred = os.getenv("LLM_PROVIDER", "").strip().lower()
+    if preferred and not have.get(preferred):
+        logger.warning("LLM_PROVIDER=%r has no server key set; falling back to another provider.", preferred)
+    for name in ([preferred] if have.get(preferred) else []) + ["gemini", "claude"]:
+        if have.get(name):
+            return name
+    raise LLMError("not_configured", "No GEMINI_API_KEY or ANTHROPIC_API_KEY is set on the server.")
 
-    if provider == "claude":
-        response = client.messages.create(
-            model=model or CLAUDE_MODEL,
-            max_tokens=max_tokens,
-            system=system_prompt,
-            messages=conversation_history
-        )
-        reply = "".join(
-            block.text for block in response.content if block.type == "text"
-        )
-        in_tok = response.usage.input_tokens
-        out_tok = response.usage.output_tokens
 
-    elif provider == "gemini":
-        response = client.models.generate_content(
-            model=model or GEMINI_MODEL,
-            contents=_gemini_contents(conversation_history),
-            config=genai_types.GenerateContentConfig(
-                system_instruction=system_prompt,
-                max_output_tokens=max_tokens,
-            )
-        )
-        # response.text is a convenience property that joins all text parts of
-        # the first candidate — same "just give me the string" contract the
-        # Claude/Groq branches below return. Falls back to "" (not None) on an
-        # empty/blocked candidate so callers' later .strip()/json.loads calls
-        # fail predictably (bad JSON -> clean "unreadable response" error)
-        # rather than raising a confusing TypeError deeper in the pipeline.
-        reply = response.text or ""
-        usage = response.usage_metadata
-        in_tok = usage.prompt_token_count if usage else 0
-        out_tok = usage.candidates_token_count if usage else 0
+def _classify(exc):
+    """Map any SDK exception to (reason, retryable). Never trusts exception text for control flow beyond 'key'."""
+    status = getattr(exc, "status_code", None) or getattr(exc, "code", None)
+    name = type(exc).__name__.lower()
+    text = str(exc).lower()
+    if status == 429 or "ratelimit" in name or "resource_exhausted" in text:
+        return "rate_limited", True
+    if status in (401, 403) or "api key not valid" in text or "api_key_invalid" in text:
+        return "invalid_api_key", False
+    if status in (500, 502, 503, 504, 529):
+        return "generation_failed", True
+    return "generation_failed", False
 
-    else:  # groq
-        groq_messages = [{"role": "system", "content": system_prompt}] + conversation_history
-        response = client.chat.completions.create(
-            model=GROQ_MODEL,
-            max_tokens=max_tokens,
-            messages=groq_messages
-        )
-        reply = response.choices[0].message.content
-        usage = response.usage
-        in_tok = usage.prompt_tokens if usage else 0
-        out_tok = usage.completion_tokens if usage else 0
 
-    logger.info(f"[{provider}] reply ok — in:{in_tok} out:{out_tok}")
-    return reply, in_tok, out_tok
+def _call_claude(api_key, model, system_prompt, history, max_tokens):
+    import anthropic  # lazy: a missing SDK only breaks that provider
+
+    client = anthropic.Anthropic(api_key=api_key, timeout=REQUEST_TIMEOUT_S, max_retries=0)
+    r = client.messages.create(model=model, max_tokens=max_tokens, system=system_prompt, messages=history)
+    text = "".join(b.text for b in r.content if b.type == "text")
+    return LLMReply(text, r.usage.input_tokens, r.usage.output_tokens, r.stop_reason == "max_tokens")
+
+
+def _call_gemini(api_key, model, system_prompt, history, max_tokens, json_mode):
+    from google import genai  # lazy, same reason
+    from google.genai import types
+
+    client = genai.Client(api_key=api_key, http_options=types.HttpOptions(timeout=REQUEST_TIMEOUT_S * 1000))
+    cfg = {"system_instruction": system_prompt, "max_output_tokens": max_tokens}
+    if json_mode:
+        cfg["response_mime_type"] = "application/json"
+    contents = [
+        {"role": "model" if t["role"] == "assistant" else "user", "parts": [{"text": t["content"]}]}
+        for t in history
+    ]
+    r = client.models.generate_content(model=model, contents=contents, config=types.GenerateContentConfig(**cfg))
+    usage = r.usage_metadata
+    cand = r.candidates[0] if r.candidates else None
+    return LLMReply(
+        r.text or "",
+        (usage.prompt_token_count or 0) if usage else 0,
+        (usage.candidates_token_count or 0) if usage else 0,
+        bool(cand and "MAX_TOKENS" in str(cand.finish_reason)),
+    )
+
+
+def ask(system_prompt, conversation_history, *, max_tokens=1024, effort="low", json_mode=False,
+        user_api_key=None, user_gemini_api_key=None):
+    """
+    One LLM call -> LLMReply. Raises LLMError only.
+
+    effort picks the Claude model tier (Gemini has a single model). Callers use
+    "low" for chat and extraction (cheap, short tasks) and the student's chosen
+    tier only for schedule generation. One automatic retry for 429/5xx.
+    BYO keys are used for this call only: nothing here stores or logs them.
+    """
+    provider = resolve_provider(user_api_key, user_gemini_api_key)
+    effort = effort if effort in EFFORTS else "medium"
+    for attempt in (1, 2):
+        try:
+            if provider == "claude":
+                key = user_api_key or os.getenv("ANTHROPIC_API_KEY")
+                reply = _call_claude(key, CLAUDE_MODEL_BY_EFFORT[effort], system_prompt, conversation_history, max_tokens)
+            else:
+                key = user_gemini_api_key or os.getenv("GEMINI_API_KEY")
+                reply = _call_gemini(key, GEMINI_MODEL, system_prompt, conversation_history, max_tokens, json_mode)
+            logger.info("[%s] ok in=%s out=%s truncated=%s", provider, reply.in_tokens, reply.out_tokens, reply.truncated)
+            return reply
+        except Exception as exc:  # noqa: BLE001 — SDKs raise many types; all are mapped below
+            reason, retryable = _classify(exc)
+            logger.error("[%s] call failed (%s, attempt %d): %s: %s", provider, reason, attempt,
+                         type(exc).__name__, str(exc)[:300])
+            if attempt == 1 and retryable:
+                time.sleep(RETRY_DELAY_S + random.random())
+                continue
+            raise LLMError(reason, f"{provider} call failed") from exc
+
+
+def extract_json(raw_text):
+    """Parse the first JSON object in model text, tolerating ``` fences and surrounding prose. Raises ValueError."""
+    text = re.sub(r"^```[a-zA-Z]*\s*|\s*```$", "", (raw_text or "").strip()).strip()
+    start, end = text.find("{"), text.rfind("}")
+    if start == -1 or end <= start:
+        raise ValueError("no JSON object in model reply")
+    return json.loads(text[start:end + 1])
+
+
+def ask_json(system_prompt, conversation_history, **kwargs):
+    """ask() + extract_json(). Raises LLMError('generation_failed', truncated=...) if the reply isn't valid JSON."""
+    reply = ask(system_prompt, conversation_history, json_mode=True, **kwargs)
+    try:
+        return extract_json(reply.text)
+    except ValueError as exc:
+        logger.error("Unparseable JSON (truncated=%s, out=%s): %s | tail: %r",
+                     reply.truncated, reply.out_tokens, exc, reply.text[-200:])
+        raise LLMError("generation_failed", "unreadable JSON", truncated=reply.truncated) from exc
