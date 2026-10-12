@@ -1,135 +1,56 @@
-# Running the backend
+# BioSync setup
 
-## 1. System requirement (for OCR)
-Image/photo document parsing needs the `tesseract` OCR engine installed as a
-system program — the `pytesseract` Python package is only a wrapper around it.
-
-- Ubuntu/Debian: `sudo apt-get install tesseract-ocr`
-- Mac: `brew install tesseract`
-- Windows: install from https://github.com/UB-Mannheim/tesseract/wiki
-
-Without this, `.pdf`/`.docx`/`.xlsx` uploads still work fine — only image
-uploads (`.png`/`.jpg`/`.jpeg`/`.webp`) will fail.
-
-## 2. Python dependencies
+## Run locally
 ```
 cd backend
 pip install -r requirements.txt
+cp .env.example .env        # add GEMINI_API_KEY and/or ANTHROPIC_API_KEY
+python app.py               # http://localhost:5000
+python -m unittest discover -s tests -v    # 16 offline tests, no API key needed
 ```
+Photo/image uploads also need the `tesseract` program (`apt install tesseract-ocr`, `brew install tesseract`,
+or the UB-Mannheim Windows installer). PDF/Word/Excel work without it.
 
-## 3. API keys
-```
-cp .env.example .env
-```
-Then open `.env` and fill in:
-- `FLASK_SECRET_KEY` — any random string
-- `GROQ_API_KEY` — free, from https://console.groq.com (used by chat_handler.py
-  and syllabus_structurer.py by default)
-- `GROQ_API_KEY` is the only LLM key required: chat_handler.py,
-  syllabus_structurer.py and schedule_generator.py all have `PROVIDER = "groq"`
-  near the top of the file, so Groq (free tier) is the default everywhere.
-- `ANTHROPIC_API_KEY` — optional. Only needed if you switch a step to Claude
-  by changing that file's `PROVIDER = "groq"` to `PROVIDER = "claude"` (one
-  line per file). schedule_generator.py is the step where Claude is most worth
-  it if Groq's free-tier quality or rate limits become a problem.
-- `DEFAULT_LLM_PROVIDER` — only used by `llm_client.ask()` when a caller passes
-  no provider. All three scripts pass one explicitly, so changing this value
-  does not by itself switch them.
-
-## 3b. Schedule detail (Low/Medium/High) and bring-your-own Claude key
-- The chat page has a Low/Medium/High "Schedule detail" selector. It changes
-  how much per-block detail `schedule_generator.py` asks the LLM for and its
-  `max_tokens` budget — Low=2000, Medium/High=5000 on Groq (see that file's
-  module docstring for the full reasoning; this replaced a single flat
-  `max_tokens=3000` that was truncating full-detail responses mid-JSON).
-  Stored server-side per session (`POST /api/effort`), defaults to Medium.
-- Also on the chat page: an opt-in "Use my own Claude API key" control. When
-  on, that request's chat/structuring/schedule-generation calls use the
-  pasted key instead of the shared `ANTHROPIC_API_KEY`/`GROQ_API_KEY` — sent
-  only as the `X-Anthropic-Api-Key` header on `/api/chat` and
-  `/api/schedule/retry`, kept in the browser's `sessionStorage` only (cleared
-  when the tab closes), never written to `SESSIONS`, a log, or disk. On this
-  path, the SAME Low/Medium/High selector picks a Claude model tier instead
-  of a Groq token tier: Low→`claude-haiku-4-5-20251001` (already the only
-  Claude model this repo used), Medium→`claude-sonnet-5-5`, High→
-  `claude-opus-5-5` (see `llm_client.py`'s `CLAUDE_MODEL_BY_EFFORT`), each
-  with a materially higher `max_tokens` (4000/8000/16000) than the Groq tiers.
-
-## 4. Run it
-```
-python app.py
-```
-Starts on http://localhost:5000 and serves the frontend directly (landing
-page at `/`), so you don't need a separate static file server for local
-testing/demo.
-
-## 5. Switch the frontend off mock mode
-Open `frontend/script.js` and change the line near the top:
-```js
-const USE_MOCK = true;
-```
-to
-```js
-const USE_MOCK = false;
-```
-Without this, the frontend will keep showing fake scripted responses instead
-of talking to the real backend.
-
-## What each script does (quick reference)
-| File | Job | Calls an LLM? |
+## Environment variables (all of them)
+| Variable | Needed | Purpose |
 |---|---|---|
-| `llm_client.py` | Shared Claude/Groq client, used by the 3 scripts below | — |
-| `chat_handler.py` | Asks the fixed checklist of questions | Yes (Groq) |
-| `document_parser.py` | Extracts text from PDF/Word/Excel/image uploads | No — plain code + OCR |
-| `syllabus_structurer.py` | Turns messy extracted text into structured subject data | Yes (Groq) |
-| `schedule_generator.py` | Builds the actual weekly schedule (circadian rhythm reasoning) | Yes (Groq by default; Claude optional) |
-| `app.py` | Flask routes tying it all together, matches the frontend's exact API contract | — |
+| `APP_ENV` | no (default `production`) | `development` locally. In production the app refuses to start without a real `FLASK_SECRET_KEY`. |
+| `FLASK_SECRET_KEY` | production | Signs the session cookie. |
+| `GEMINI_API_KEY` / `ANTHROPIC_API_KEY` | at least one | Shared server keys. Students can also paste their own on the chat page. |
+| `LLM_PROVIDER` | no | `gemini` or `claude`; used when both keys exist. Otherwise the first key found wins. |
+| `GEMINI_MODEL` | no (default `gemini-3.5-flash`) | Google retires models on a schedule (`gemini-2.5-flash` was due to shut down 2026-10-16). Verify the model is on your key's free tier in AI Studio. |
+| `COOKIE_SECURE`, `TRUSTED_PROXY_HOPS` | deploy | `1` and `1` behind Render's HTTPS proxy (set in `render.yaml`). |
+| `PORT`, `FLASK_DEBUG` | no | Port (default 5000); debug is ignored in production. |
 
-## API contract note: `/api/schedule` response shape
-As of the BioSync analytics upgrade, `GET /api/schedule` returns one JSON
-object (not a bare array):
+## Deploy (Render)
+Push the repo, create a Blueprint from `render.yaml`, set `GEMINI_API_KEY` (and optionally `ANTHROPIC_API_KEY`).
+Run a single instance: sessions are in memory, so a second instance would not see the first one's sessions.
+
+## How it works
+`chat_handler` (7 fixed questions) -> `document_parser` (plain code + OCR) -> `syllabus_structurer` (LLM, cheapest model)
+-> `schedule_generator` (LLM, then validated in code). `llm_client` is the only file that talks to a provider.
+
+- **Schedule detail** (Low/Medium/High) changes how much per-block reasoning is requested. With a pasted Claude key it
+  also picks Haiku/Sonnet/Opus for the schedule step only. Chat and file reading always use the cheapest tier.
+- **Reliability:** every reply is validated (7 days, allowed block types, energy levels). Weekly hours and the subject
+  breakdown are recomputed from block times, not trusted from the model. A truncated or incomplete reply gets one retry
+  with a more compact prompt. Rate limits and rejected keys are reported honestly and not retried.
+- **Limits enforced server-side:** 20 MB per file, 8 files per session, file-signature check, 40 PDF pages, 1,500
+  characters per chat message, per-IP rate limits (chat 30/min, upload 10/min, retry 6/min).
+- **Privacy:** uploaded files are deleted right after text extraction. Pasted API keys are used for one request and never
+  stored or logged. Sessions expire after 6 hours of inactivity.
+
+## `GET /api/schedule` shape
 ```json
-{
-  "schedule": [ { "day": "Monday", "focus_summary": "...", "blocks": [
-      { "time": "7:00–8:00", "activity": "...", "type": "study",
-        "subject": "Data Structures", "energy": "high", "note": "..." }
-  ] } ],
-  "reasoning_notes": "...",
-  "weekly_focus_hours": 16,
-  "subject_breakdown": [ { "subject": "Data Structures", "hours_this_week": 4 } ]
-}
+{"status": "pending|ready|failed", "schedule": [{"day": "Monday", "focus_summary": "", "blocks": [
+  {"time": "7:00–8:00", "activity": "", "type": "study|break|meal|sleep|class|other", "subject": "", "energy": "high|medium|low", "note": ""}]}],
+ "reasoning_notes": "", "weekly_focus_hours": 16, "subject_breakdown": [{"subject": "", "hours_this_week": 4}],
+ "error": null, "reason": null, "warnings": []}
 ```
-The object also carries `status` (`"pending"` = chat not finished,
-`"ready"`, or `"failed"`), plus `error` and `reason` when `status` is
-`"failed"`. `reason` is `rate_limited` (the LLM provider's rate limit was hit),
-`generation_failed` (any other LLM failure or unreadable reply), or
-`internal_error` (unexpected backend crash); `error` is a user-safe message —
-the raw provider error is only written to the server log. A failure is still
-HTTP 200: the signal is in the body. `POST /api/schedule/retry` re-runs the
-pipeline after a failure and returns the same shape.
+`reason` when failed: `rate_limited`, `invalid_api_key`, `not_configured`, `generation_failed`, `internal_error`.
+`warnings` is new and additive (e.g. uploaded files could not be read). A failure is still HTTP 200.
 
-`type` is one of `study` / `break` / `meal` / `sleep` / `class` / `other`,
-and `energy` is `high` / `medium` / `low` — both come straight from
-`schedule_generator.py`'s prompt, not computed separately. The results
-page (`frontend/results.html` + `script.js`) uses these fields to draw
-the Analytics tab (subject-hours chart, focus/break donut, energy
-heatmap) and the per-block reasoning notes in the Weekly view. The
-frontend still tolerates the old bare-array shape as a fallback, so nothing
-breaks if an older backend build is swapped in.
-
-## Known limitations (be upfront about these, don't let them surprise you mid-demo)
-- State is in-memory only — restarting the Flask server loses all in-progress
-  sessions. No database in this MVP.
-- OCR on scanned/photographed documents is not guaranteed to be perfectly
-  accurate — test with a real sample of what you plan to demo with, ahead of time.
-- `document_parser.py` does not OCR-fallback for scanned PDFs with no text
-  layer (only for standalone image files) — a scanned PDF syllabus may come
-  back empty.
-- Legacy `.doc` (not `.docx`) files are not supported — only `.docx`.
-  (Legacy `.xls` *is* supported, via `xlrd`.)
-- Groq's free tier is rate-limited. When it rejects a request the results
-  page says so and offers a retry, plus a clearly labeled example schedule.
-  The example is also available any time at `results.html?example=1`.
-- The Low effort tier is the one most likely to reliably finish on Groq's
-  free tier; High is opt-in and still the most likely of the three to run
-  long on Groq (it asks for the most detail) — that's expected, not a bug.
+## Known limitations
+- Sessions are in memory: a restart clears in-progress chats (deliberate, see below).
+- The pipeline runs inside the final chat request (typically 20–40 s). A host with a short proxy timeout would cut it off.
+- Scanned PDFs with no text layer come back empty (OCR only runs on image files). Legacy `.doc` is not supported.

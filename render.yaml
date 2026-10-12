@@ -4,12 +4,21 @@ services:
     runtime: docker
     dockerfilePath: ./backend/Dockerfile
     dockerContext: .
+    healthCheckPath: /healthz
     envVars:
+      - key: APP_ENV
+        value: production
       - key: FLASK_SECRET_KEY
-        sync: false
-      - key: GROQ_API_KEY
+        generateValue: true
+      - key: COOKIE_SECURE
+        value: "1"
+      - key: TRUSTED_PROXY_HOPS
+        value: "1"
+      - key: LLM_PROVIDER
+        value: gemini
+      - key: GEMINI_MODEL
+        value: gemini-3.5-flash
+      - key: GEMINI_API_KEY
         sync: false
       - key: ANTHROPIC_API_KEY
         sync: false
-      - key: DEFAULT_LLM_PROVIDER
-        value: groq
