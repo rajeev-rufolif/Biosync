@@ -23,10 +23,14 @@
 <section class="chat-panel" id="panel" aria-label="Chat with BioSync">
   <div class="chat-head">
     <span class="avatar" data-mascot aria-hidden="true"></span>
-    <div><h1>Build your week</h1><p><span class="status" aria-hidden="true"></span>Seven quick questions, then your schedule</p></div>
+    <div><h1 id="chatTitle">Build your week</h1><p><span class="status" aria-hidden="true"></span><span id="chatSub">Seven quick questions, then your schedule</span></p></div>
     <span class="step-count" id="progressText">Question 1 of 7</span>
   </div>
   <div class="progress" id="progress" role="progressbar" aria-label="Chat progress" aria-valuemin="0" aria-valuemax="7" aria-valuenow="0"><i id="progressBar"></i></div>
+  <div class="revise-bar" id="reviseBar" hidden>
+    <span id="reviseStatus" role="status" aria-live="polite">Changes you ask for replace your schedule; undo brings the last one back.</span>
+    <button type="button" class="btn ghost" id="undoBtn" hidden>Undo last change</button>
+  </div>
   <details class="settings">
   <summary>Schedule detail and your own AI key (optional)</summary>
   <div class="settings-bar" id="settingsBar">

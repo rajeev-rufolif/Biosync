@@ -299,3 +299,11 @@ a,button,summary,select,input,textarea{touch-action:manipulation}
   .donut-wrap{justify-content:center}
   .heatmap-card{margin-bottom:40px}
 }
+
+/* ---------- revision mode (chat edits the finished schedule) ---------- */
+.revise-bar{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:10px 16px;padding:10px 20px;border-bottom:1px solid var(--border);background:rgba(45,226,166,.06);color:var(--text-2);font-size:.875rem}
+.revise-bar[hidden]{display:none}
+.revise-bar .btn{min-height:40px;padding:0 16px}
+.choices{display:flex;flex-wrap:wrap;gap:10px;align-self:center;margin-top:4px}
+.notice.ok{border-color:rgba(45,226,166,.4);background:rgba(45,226,166,.06)}
+.notice.ok strong{color:var(--accent)}

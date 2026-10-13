@@ -2,6 +2,7 @@
 // Set to false once the Flask backend exposes /api/chat, /api/upload, /api/schedule.
 const USE_MOCK = false;
 const STREAK_KEY = 'biosync.streak.v1'; // localStorage: { count, last: 'YYYY-MM-DD' }
+const CACHE_KEY = 'biosync.lastSchedule.v1'; // localStorage: { schedule, reasoning_notes } of the last finished schedule, so a server restart doesn't lose it
 // sessionStorage (Task 8/8b — NOT localStorage, on purpose): { provider: 'none'|'claude'|'gemini', keys: { claude: '', gemini: '' } }
 // Replaces the old v1 key (single Claude-only { enabled, key } shape) — a provider
 // field supports either BYO provider without a second storage key to keep in sync,
@@ -66,7 +67,10 @@ function authHeaders() {
 }
 
 /* ===== API (mocked until backend exists) ===== */
-const GREETING = "Hi! I'm BioSync. Let's build your week. What courses are you taking this term?";
+// Real mode shows the backend's own greeting (GET /api/chat/state); this is only the offline fallback, worded to match it.
+const GREETING = USE_MOCK
+  ? "Hi! I'm BioSync. Let's build your week. What courses are you taking this term?"
+  : "Hi! I'm BioSync. I'll ask a few quick questions so I can build a schedule that actually fits your life — let's start with the basics. What college or university do you attend?";
 const MOCK_REPLIES = [
   "Nice. Any exams or big deadlines coming up in the next few weeks?",
   "When do you focus best: morning, afternoon, or late evening?",
@@ -88,7 +92,13 @@ async function sendMessage(text) {
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
     body: JSON.stringify({ message: text })
   });
-  if (!res.ok) throw new Error('chat ' + res.status);
+  if (!res.ok) {
+    if (res.status === 409 || res.status === 429) { // double-tap or too fast: the server's sentence is student-safe
+      const j = await res.json().catch(() => ({}));
+      throw apiError(j, 'chat ' + res.status);
+    }
+    throw new Error('chat ' + res.status);
+  }
   const data = await res.json();
   // data.reply = the AI's text response to show
   // data.done = true once enough info is collected
@@ -206,6 +216,48 @@ async function retrySchedule() {
   return await res.json();
 }
 
+/* ===== Revision mode helpers: chat edits the finished schedule ===== */
+// An error whose message is a student-safe sentence from the server carries friendly=true; anything else gets generic wording.
+function apiError(body, fallback) {
+  const e = new Error((body && body.error) || fallback);
+  e.friendly = !!(body && body.error);
+  return e;
+}
+const isBusy = d => !!d && !Array.isArray(d) && (d.status === 'generating' || (!!d.revision && d.revision.status === 'revising'));
+
+async function fetchChatState() {
+  const res = await fetch('/api/chat/state');
+  if (!res.ok) throw new Error('chat state ' + res.status);
+  return await res.json(); // { step, total, done, greeting, messages, documents, mode, can_undo, revision, ... }
+}
+async function undoSchedule() {
+  const res = await fetch('/api/schedule/undo', { method: 'POST' });
+  const j = await res.json().catch(() => ({}));
+  if (!res.ok) throw apiError(j, 'undo ' + res.status);
+  return j;
+}
+async function restoreSchedule(saved) {
+  const res = await fetch('/api/schedule/restore', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ schedule: saved.schedule, reasoning_notes: saved.reasoning_notes || '' })
+  });
+  const j = await res.json().catch(() => ({}));
+  if (!res.ok) throw apiError(j, 'restore ' + res.status);
+  return j;
+}
+// The browser keeps the last finished schedule (never keys, never chat text). Writing it also pings other open tabs via the storage event.
+function cacheSchedule(d) {
+  if (!d || Array.isArray(d) || d.status !== 'ready' || !(d.schedule || []).length) return;
+  try { localStorage.setItem(CACHE_KEY, JSON.stringify({ schedule: d.schedule, reasoning_notes: d.reasoning_notes || '' })); } catch (e) { /* storage blocked: fine */ }
+}
+function readCachedSchedule() {
+  try {
+    const o = JSON.parse(localStorage.getItem(CACHE_KEY) || 'null');
+    return o && Array.isArray(o.schedule) && o.schedule.length ? o : null;
+  } catch (e) { return null; }
+}
+
 /* ===== Chat page: effort selector (Task 7) ===== */
 // Lives before/alongside the checklist (visible for the whole chat, not a
 // checklist question) so it can be changed any time before the pipeline runs.
@@ -291,14 +343,15 @@ function initChat() {
   sendBtn.innerHTML = ICON.send;
   initEffortSelector();
   initByok();
-  let busy = false, finished = false, answered = 0;
+  let busy = false, finished = false, answered = 0, reviseMode = false, viewLink = null;
   const pBar = $('progressBar'), pText = $('progressText'), pWrap = $('progress');
+  const reviseBar = $('reviseBar'), reviseStatus = $('reviseStatus'), undoBtn = $('undoBtn');
   function updateProgress() {
     if (!pBar) return;
-    const n = Math.min(answered, 7);
+    const n = reviseMode ? 7 : Math.min(answered, 7);
     pBar.style.width = (n / 7 * 100) + '%';
     pWrap.setAttribute('aria-valuenow', String(n));
-    pText.textContent = n >= 7 ? 'All set' : `Question ${n + 1} of 7`;
+    pText.textContent = reviseMode ? 'Edit mode' : (n >= 7 ? 'All set' : `Question ${n + 1} of 7`);
   }
 
   const scroll = () => box.scrollTo({ top: box.scrollHeight, behavior: 'smooth' });
@@ -339,7 +392,66 @@ function initChat() {
     box.append(a); scroll();
     input.disabled = true; input.placeholder = 'All done!';
   }
-  function setBusy(v) { busy = v; sendBtn.disabled = v || finished; }
+  // One "See my schedule" button that moves to the bottom of the chat after each revision.
+  function showViewLink() {
+    if (!viewLink) {
+      viewLink = document.createElement('a');
+      viewLink.className = 'btn done-cta'; viewLink.href = 'results.html'; viewLink.textContent = 'See my schedule';
+    }
+    box.append(viewLink); scroll();
+  }
+  // A row of buttons under the chat; clicking one disables the row, runs it, then removes it.
+  function addChoices(items) {
+    const wrap = document.createElement('div');
+    wrap.className = 'choices';
+    items.forEach(([label, fn, ghost]) => {
+      const b = document.createElement('button');
+      b.type = 'button'; b.className = 'btn' + (ghost ? ' ghost' : ''); b.textContent = label;
+      b.addEventListener('click', async () => {
+        wrap.querySelectorAll('button').forEach(x => { x.disabled = true; });
+        await fn(); wrap.remove();
+      });
+      wrap.append(b);
+    });
+    box.append(wrap); scroll();
+  }
+  function setBusy(v) { busy = v; sendBtn.disabled = v || finished; undoBtn.disabled = v; }
+
+  // "Edit your schedule" mode: the checklist is done and a schedule exists, so every message is a change request.
+  function setReviseUi(canUndo) {
+    reviseMode = true; finished = false;
+    $('chatTitle').textContent = 'Edit your schedule';
+    $('chatSub').textContent = 'Describe a change and I\u2019ll update your week';
+    input.disabled = false; input.placeholder = 'e.g. Move gym to the evening';
+    sendBtn.disabled = busy;
+    reviseBar.hidden = false; undoBtn.hidden = !canUndo;
+    updateProgress();
+  }
+
+  // Polls /api/schedule while a revision runs, then reports the outcome (applied, unchanged or rejected) in the chat.
+  async function watchRevision() {
+    setBusy(true);
+    const typing = showTyping();
+    let d = null;
+    try {
+      for (let i = 0; i < 400; i++) {
+        d = await fetchSchedule();
+        if (!(d.revision && d.revision.status === 'revising')) break;
+        reviseStatus.textContent = `Updating your schedule\u2026 ${d.revision.elapsed_s || 0}s`;
+        await sleep(1500);
+      }
+    } catch (e) { d = null; }
+    typing.remove(); reviseStatus.textContent = '';
+    setBusy(false);
+    if (!d || !d.revision || d.revision.status === 'revising') {
+      addMsg('ai', "I lost touch with the server while updating. Open your schedule to check whether the change landed.");
+    } else {
+      cacheSchedule(d);
+      addMsg('ai', d.revision.message + (d.revision.status === 'applied' && d.revision.notes ? ' ' + d.revision.notes : ''));
+      undoBtn.hidden = !d.can_undo;
+    }
+    showViewLink();
+  }
 
   async function handleSend() {
     const text = input.value.trim();
@@ -351,16 +463,23 @@ function initChat() {
     try {
       const data = await sendMessage(text);
       typing.remove();
-      addMsg('ai', data.reply); answered++; updateProgress();
-      if (data.done) { finished = true; showDone(); }
+      addMsg('ai', data.reply);
+      if (data.mode === 'revise') {
+        setReviseUi(!!data.can_undo);
+        if (data.revising) await watchRevision();
+      } else {
+        answered++; updateProgress();
+        if (data.done) { finished = true; showDone(); }
+      }
     } catch (e) {
       typing.remove();
-      addMsg('ai', "I couldn't reach the server. Check your connection and send that again.");
+      addMsg('ai', e.friendly ? e.message : "I couldn't reach the server. Check your connection and send that again.");
     }
     setBusy(false); if (!finished) input.focus();
   }
 
   async function handleFiles(files) {
+    if (reviseMode) { addMsg('ai', "I can only edit your schedule from what you type here, so please describe the change in words."); return; }
     for (const file of files) {
       addFile(file.name);
       const ext = file.name.split('.').pop().toLowerCase();
@@ -389,6 +508,19 @@ function initChat() {
   });
   $('attach').addEventListener('click', () => $('file').click());
   $('file').addEventListener('change', e => { handleFiles([...e.target.files]); e.target.value = ''; });
+  undoBtn.addEventListener('click', async () => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      const d = await undoSchedule();
+      cacheSchedule(d);
+      addMsg('ai', (d.revision && d.revision.message) || 'Done.');
+      undoBtn.hidden = !d.can_undo; showViewLink();
+    } catch (e) {
+      addMsg('ai', e.friendly ? e.message : "I couldn't undo that just now. Try again in a moment.");
+    }
+    setBusy(false);
+  });
 
   // drop files anywhere on the page (also stops the browser from navigating to a dropped file)
   let drags = 0;
@@ -402,10 +534,50 @@ function initChat() {
     handleFiles([...e.dataTransfer.files]);
   });
 
-  // opening message
+  // The server remembers the chat (GET /api/chat/state); redraw it instead of always starting from question 1.
+  function replay(st) {
+    addMsg('ai', st.greeting || GREETING);
+    (st.messages || []).forEach(m => addMsg(m.role === 'user' ? 'user' : 'ai', m.content));
+    (st.documents || []).forEach(d => addFile(d.name || 'document'));
+    answered = Math.min(st.step || 0, 7); updateProgress();
+  }
+  // The server forgot this student (restart or idle expiry) but this browser still has their last schedule: say so, and offer it back.
+  function offerSavedSchedule(saved, greeting) {
+    addMsg('ai', "Welcome back. I've lost track of our earlier chat: my memory is cleared whenever the server restarts or a session sits idle for a few hours, so I no longer have your answers. Your last schedule is still saved in this browser, though. I can load it back so we can edit it, or you can start fresh with the questions.");
+    addChoices([
+      ['Edit my saved schedule', async () => {
+        try {
+          const d = await restoreSchedule(saved);
+          cacheSchedule(d); setReviseUi(false);
+          addMsg('ai', "Your saved schedule is loaded. Tell me what you'd like to change. I don't remember the reasons behind the original plan, so mention anything important.");
+          showViewLink();
+        } catch (e) {
+          addMsg('ai', (e.friendly ? e.message : "I couldn't load your saved schedule just now.") + " Let's start fresh instead.");
+          addMsg('ai', greeting);
+        }
+      }],
+      ['Start fresh', async () => { addMsg('ai', greeting); }, true]
+    ]);
+  }
+
   (async () => {
-    const t = showTyping(); await sleep(700); t.remove();
-    addMsg('ai', GREETING);
+    const t = showTyping();
+    let st = null;
+    if (!USE_MOCK) { try { st = await fetchChatState(); } catch (e) { st = null; } }
+    await sleep(500); t.remove();
+    const greeting = (st && st.greeting) || GREETING;
+    if (st && st.mode === 'revise') {
+      replay(st); setReviseUi(!!st.can_undo);
+      addMsg('ai', "Your schedule is ready, so this chat now edits it. Tell me what to change, like \u201cmove gym to the evening\u201d or \u201cI have a new exam on Friday\u201d.");
+      showViewLink();
+      if (st.revision && st.revision.status === 'revising') watchRevision();
+    } else if (st && (st.step > 0 || (st.messages || []).length)) {
+      replay(st);
+      if (st.done) { finished = true; showDone(); }
+    } else {
+      const saved = st ? readCachedSchedule() : null;
+      if (saved) offerSavedSchedule(saved, greeting); else addMsg('ai', greeting);
+    }
   })();
 }
 
@@ -898,7 +1070,7 @@ function showScheduleFailure(data) {
   retry.addEventListener('click', async () => {
     retry.disabled = true; retry.textContent = 'Trying again…';
     try {
-      showResults(await retrySchedule());
+      await settleAndShow(await retrySchedule());
     } catch (e) {
       retry.disabled = false; retry.textContent = 'Try again';
       errorNotice.querySelector('p').textContent = "Couldn't reach the server. Check your connection and try again.";
@@ -920,10 +1092,67 @@ function showResults(data) {
 
   const schedule = Array.isArray(data) ? data : (data.schedule || []);
   if (!schedule.length) {
+    const saved = Array.isArray(data) ? null : readCachedSchedule();
+    if (saved && data.status === 'pending') { showLostSession(saved); return; }
     $('resultsBody').innerHTML = '<p class="state">No schedule yet. <a href="chat.html">Chat with BioSync</a> to build one.</p>';
     return;
   }
+  cacheSchedule(data);
   renderScheduleView($('resultsBody'), data);
+  const notices = [];
+  const rev = Array.isArray(data) ? null : data.revision;
+  if (rev && rev.status !== 'revising') notices.push(revisionNotice(data));
+  const warnings = Array.isArray(data) ? [] : (data.warnings || []);
+  if (warnings.length) notices.push(makeNotice('example', 'Heads up', warnings.join(' '), []));
+  $('resultsNotice').replaceChildren(...notices);
+}
+
+// A revision (or a first build) may still be running: show progress, keep any existing schedule on screen, poll, then show the result.
+function busyNotice(d) {
+  const rev = !!(d.revision && d.revision.status === 'revising');
+  const p = (rev ? d.revision : d.progress) || {};
+  const label = rev ? 'Updating your schedule'
+    : ({ structuring: 'Reading your files', scheduling: 'Building your week' }[p.stage] || 'Getting started');
+  return makeNotice('example', label + '\u2026', `${p.elapsed_s || 0}s so far. This usually takes under a minute, and you can leave this page open.`, []);
+}
+async function settleAndShow(data) {
+  let drawn = false;
+  for (let i = 0; i < 400 && isBusy(data); i++) {
+    if (!drawn && data.status === 'ready' && (data.schedule || []).length) { renderScheduleView($('resultsBody'), data); drawn = true; }
+    $('resultsNotice').replaceChildren(busyNotice(data));
+    await sleep(1500);
+    data = await fetchSchedule();
+  }
+  showResults(data);
+}
+function revisionNotice(data) {
+  const r = data.revision;
+  const titles = { applied: 'Schedule updated', unchanged: 'No change needed', rejected: 'Change not applied', undone: 'Change undone' };
+  const actions = [];
+  if (data.can_undo) {
+    const undo = document.createElement('button');
+    undo.type = 'button'; undo.className = 'btn ghost'; undo.textContent = 'Undo last change';
+    undo.addEventListener('click', async () => {
+      undo.disabled = true;
+      try { showResults(await undoSchedule()); }
+      catch (e) { undo.disabled = false; toast(e.friendly ? e.message : "Couldn't undo just now. Try again in a moment."); }
+    });
+    actions.push(undo);
+  }
+  return makeNotice(r.status === 'rejected' ? 'error' : 'ok', titles[r.status] || 'Schedule', r.message || '', actions);
+}
+// The server has no record of this student but this browser kept their last schedule: show it, labeled, and offer to load it back.
+function showLostSession(saved) {
+  const restore = document.createElement('button');
+  restore.type = 'button'; restore.className = 'btn'; restore.textContent = 'Load it back and edit';
+  restore.addEventListener('click', async () => {
+    restore.disabled = true;
+    try { await settleAndShow(await restoreSchedule(saved)); }
+    catch (e) { restore.disabled = false; toast(e.friendly ? e.message : "Couldn't load it back just now. Try again in a moment."); }
+  });
+  $('resultsNotice').replaceChildren(makeNotice('example', 'Your session was reset',
+    "The server restarted or your session expired, so it no longer has this schedule. This is the last copy saved in this browser. Load it back to keep editing it by chat.", [restore]));
+  renderScheduleView($('resultsBody'), saved);
 }
 
 async function initResults() {
@@ -931,10 +1160,12 @@ async function initResults() {
   if (new URLSearchParams(location.search).get('example') === '1') { showExample(); return; }
 
   try {
-    showResults(await fetchSchedule());
+    await settleAndShow(await fetchSchedule());
   } catch (e) {
     $('resultsBody').innerHTML = "<p class='state'>We couldn't load your schedule. Refresh the page to try again.</p>";
   }
+  // A revision finished in the chat tab (it rewrites the cached copy): refresh this tab too.
+  window.addEventListener('storage', e => { if (e.key === CACHE_KEY) fetchSchedule().then(settleAndShow).catch(() => {}); });
 }
 
 const page = document.body.dataset.page;
