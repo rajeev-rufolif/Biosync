@@ -155,3 +155,13 @@ breaks if an older backend build is swapped in.
 - The Low effort tier is the one most likely to reliably finish on Groq's
   free tier; High is opt-in and still the most likely of the three to run
   long on Groq (it asks for the most detail) — that's expected, not a bug.
+
+## Revision mode (editing a finished schedule by chat)
+Once the 7 questions are answered and a schedule is ready, `/api/chat` treats every message as a change
+request. A cheap triage call (fast model tier) decides change-or-chat; a change runs as a background job
+(`pipeline.start_revision`, same thread pool as builds) using `schedule_generator.revise_schedule`, which
+shares its validation and retry code with `generate_schedule`. A revision that comes back invalid is
+discarded: the old schedule stays and the student is told it wasn't applied. The last 5 schedules are kept
+for undo. New endpoints: `POST /api/schedule/undo`, `POST /api/schedule/restore` (rebuilds a session from the
+schedule the browser kept in `localStorage` after a server restart). `GET /api/schedule` and
+`GET /api/chat/state` gain `revision`, `can_undo` and (state only) `mode`.
