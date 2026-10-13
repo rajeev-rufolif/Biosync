@@ -22,6 +22,13 @@ against; everything marked NEW only adds fields or endpoints.
   NEW  GET  /api/chat/state    redraw the chat after a refresh
   NEW  POST /api/key/test      one tiny real call proving a pasted key works
   NEW  POST /api/reset         start over
+  NEW  POST /api/schedule/undo     put the previous schedule back (up to pipeline.MAX_UNDO deep)
+  NEW  POST /api/schedule/restore  rebuild a session from a schedule the browser kept (server memory was lost)
+
+Revision mode: once the chat is done and a schedule exists, POST /api/chat treats each message as a change
+request (reply gains mode="revise", revising, can_undo, revision). GET /api/schedule gains "revision"
+({status: revising|applied|unchanged|rejected|undone, message}) and "can_undo"; the old schedule stays in
+place while a revision runs.
 
 Keys: a student's own key travels per request in X-Gemini-Api-Key or
 X-Anthropic-Api-Key (if both arrive, Claude wins, as it always has). Otherwise the
@@ -67,7 +74,8 @@ import chat_handler  # noqa: E402
 import document_parser  # noqa: E402
 import llm_client  # noqa: E402
 import pipeline  # noqa: E402
-from sessions import RateLimiter, Session, SessionStore  # noqa: E402
+import schedule_generator  # noqa: E402
+from sessions import Job, RateLimiter, Session, SessionStore  # noqa: E402
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(),
                     format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -154,6 +162,7 @@ LIMITS = {
     "key_test": (12, 120),
     "poll": (900, 3000),
     "reset": (10, 100),
+    "revise": (20, 200),     # revision-mode messages, undo and restore
 }
 
 CSP = "; ".join([
@@ -310,6 +319,20 @@ def _schedule_status(sess: Session) -> str:
     return "ready" if result.get("success") else "failed"
 
 
+def _chat_mode(sess: Session) -> str:
+    """collect = checklist in progress | build = checklist done, schedule not ready | revise = schedule exists."""
+    if not chat_handler.is_complete(sess.chat_state):
+        return "collect"
+    return "revise" if _schedule_status(sess) == "ready" else "build"
+
+
+def _revision_payload(sess: Session) -> dict | None:
+    job, outcome = sess.revision_job, sess.revision_outcome
+    if job is not None and job.status == "generating":
+        return {"status": "revising", **pipeline.job_progress(job)}
+    return dict(outcome) if outcome else None
+
+
 # ---------------------------------------------------------------------------
 # Static frontend
 # ---------------------------------------------------------------------------
@@ -400,6 +423,41 @@ def api_reset():
 # ---------------------------------------------------------------------------
 # Chat
 # ---------------------------------------------------------------------------
+def _revision_reply(sess: Session, reply: str, revising: bool = False, notice: dict | None = None):
+    with sess.lock:
+        payload = {"reply": reply, "done": True, "mode": "revise", **chat_handler.progress(sess.chat_state),
+                   "schedule_status": _schedule_status(sess), "revising": revising,
+                   "can_undo": bool(sess.schedule_history), "revision": _revision_payload(sess)}
+    if notice:
+        payload["notice"] = notice
+    return jsonify(payload)
+
+
+def _revision_turn(sess: Session, state: dict, message: str, creds, key_issue):
+    """
+    One message in revision mode (caller holds chat_lock, so double-taps cannot get here twice).
+    A cheap triage call decides change-or-chat; a change starts a background revision and returns at
+    once. Nothing here edits the schedule: pipeline.start_revision does, and only if the result is valid.
+    """
+    enforce_limit("revise")
+    with sess.lock:
+        job = sess.revision_job
+        running = job is not None and job.status == "generating"
+        days = copy.deepcopy(sess.schedule["schedule"])
+    if running:
+        return _revision_reply(sess, chat_handler.REVISION_BUSY_REPLY, revising=True)
+    turn = chat_handler.handle_revision(state, message, days, creds)
+    reply, revising = turn.reply, False
+    if turn.intent == "change":
+        job, started = pipeline.start_revision(sess, creds, turn.request, missing=key_issue)
+        revising = job is not None
+        if not started and job is not None:
+            reply = turn.state["history"][-1]["content"] = chat_handler.REVISION_BUSY_REPLY
+    with sess.lock:
+        sess.chat_state = turn.state
+    return _revision_reply(sess, reply, revising, notice_for(key_issue or turn.llm_issue))
+
+
 @app.get("/api/chat/state")
 def api_chat_state():
     sess = current_session()
@@ -414,6 +472,9 @@ def api_chat_state():
             "documents": [{"name": d.get("source_filename"), "status": "received" if d.get("success") else "failed",
                            "error": d.get("error"), "note": d.get("note")} for d in sess.parsed_docs],
             "schedule_status": _schedule_status(sess),
+            "mode": _chat_mode(sess),
+            "can_undo": bool(sess.schedule_history),
+            "revision": _revision_payload(sess),
         })
 
 
@@ -435,6 +496,9 @@ def api_chat():
         with sess.lock:
             state = copy.deepcopy(sess.chat_state) if sess.chat_state else chat_handler.new_session_state()
             was_done = chat_handler.is_complete(state)
+            revising = was_done and _schedule_status(sess) == "ready"
+        if revising:  # checklist done and a schedule exists: each message is a change request
+            return _revision_turn(sess, state, message, creds, key_issue)
         # The AI call happens here, with no lock held, so polling stays responsive.
         turn = chat_handler.handle_message(state, message, creds)
         with sess.lock:
@@ -447,7 +511,7 @@ def api_chat():
         sess.chat_lock.release()
 
     payload = {"reply": turn.reply, "done": turn.done, **chat_handler.progress(turn.state),
-               "schedule_status": _schedule_status(sess)}
+               "schedule_status": _schedule_status(sess), "mode": _chat_mode(sess)}
     notice = notice_for(key_issue or turn.llm_issue)
     if notice:
         payload["notice"] = notice
@@ -518,6 +582,7 @@ def schedule_payload(sess: Session) -> dict:
         payload = {
             "status": "pending", "schedule": [], "reasoning_notes": "", "weekly_focus_hours": None,
             "subject_breakdown": [], "error": None, "reason": None,
+            "can_undo": bool(sess.schedule_history), "revision": _revision_payload(sess),
         }
         job, result = sess.job, sess.schedule
         if job is not None and job.status == "generating":
@@ -566,6 +631,65 @@ def api_schedule_retry():
         can_retry = chat_done and (sess.job is None or sess.job.status == "failed")
     if can_retry:
         pipeline.start_job(sess, creds, missing=key_issue)
+    return jsonify(schedule_payload(sess))
+
+
+@app.post("/api/schedule/undo")
+def api_schedule_undo():
+    """Put the previous schedule back. Never while a revision is running; one step per call."""
+    enforce_limit("revise")
+    sess = current_session()
+    with sess.lock:
+        if sess.revision_job is not None and sess.revision_job.status == "generating":
+            raise ApiError(409, "busy", "One moment, I'm still updating your schedule. Undo once that finishes.")
+        if not sess.schedule_history:
+            raise ApiError(409, "nothing_to_undo", "There's no earlier version of your schedule to go back to.")
+        sess.schedule = sess.schedule_history.pop()
+        sess.revision_outcome = {"id": uuid.uuid4().hex[:12], "status": "undone",
+                                 "message": "Done, I've put your previous schedule back."}
+    return jsonify(schedule_payload(sess))
+
+
+@app.post("/api/schedule/restore")
+def api_schedule_restore():
+    """
+    The server forgot this student (restart, idle expiry) but their browser kept the last schedule.
+    Rebuild a session around it, after the same normalisation a generated schedule gets, so it can be
+    edited in revision mode. The answers behind it are gone, and the warning says so. Never replaces
+    a schedule the server already has, and never interrupts a chat in progress.
+    """
+    enforce_limit("revise")
+    body = read_json()
+    sess = current_session()
+
+    def existing():
+        return _schedule_status(sess) in ("ready", "generating")
+
+    with sess.lock:
+        if existing():
+            return jsonify(schedule_payload(sess))
+        state = sess.chat_state or {}
+        if state.get("step", 0) > 0 and not state.get("done"):
+            raise ApiError(409, "chat_in_progress", "You're partway through the questions, so I can't load a saved schedule now.")
+    try:
+        norm = schedule_generator.normalize_schedule(
+            {"schedule": body.get("schedule"), "reasoning_notes": body.get("reasoning_notes")})
+    except ValueError:
+        norm = None
+    if norm is None or not norm.usable:
+        raise ApiError(400, "bad_request", "That saved schedule couldn't be read, so I couldn't load it.")
+    hours, breakdown = schedule_generator.compute_analytics(norm.days)
+    result = {"success": True, "schedule": norm.days, "reasoning_notes": norm.reasoning,
+              "weekly_focus_hours": hours, "subject_breakdown": breakdown, "error": None, "reason": None,
+              "retry_after_s": None,
+              "warnings": ["This schedule was loaded back from your browser, so I no longer have the answers behind it."],
+              "meta": {"provider": None, "model": None, "effort": sess.effort, "partial": False, "restored": True}}
+    with sess.lock:
+        if existing():
+            return jsonify(schedule_payload(sess))
+        sess.chat_state = {"step": chat_handler.TOTAL_QUESTIONS, "answers": {}, "history": [], "done": True}
+        sess.job = Job(status="ready", stage="done", finished_at=time.time())
+        sess.schedule, sess.schedule_history, sess.revision_job, sess.revision_outcome = result, [], None, None
     return jsonify(schedule_payload(sess))
 
 

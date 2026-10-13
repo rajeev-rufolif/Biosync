@@ -51,6 +51,12 @@ class Session:
     schedule: dict | None = None                      # result of schedule_generator (success or failure)
     effort: str = "medium"
     job: Job | None = None
+    # Revision mode (the chat edits a finished schedule). schedule_history holds earlier successful
+    # schedules, newest last, for undo; revision_job is the running/last background revision;
+    # revision_outcome is what the student is told about the last one (applied / rejected / ...).
+    schedule_history: list = field(default_factory=list)
+    revision_job: Job | None = None
+    revision_outcome: dict | None = None
     # chat_lock serialises /api/chat so a double-tap cannot advance the checklist twice;
     # lock guards every other field (the build runs on another thread).
     chat_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
@@ -100,7 +106,7 @@ class SessionStore:
     def _purge_locked(self, now: float) -> int:
         self._last_purge = now
         before = len(self._items)
-        busy = lambda s: s.job is not None and s.job.status == "generating"  # noqa: E731
+        busy = lambda s: any(j is not None and j.status == "generating" for j in (s.job, s.revision_job))  # noqa: E731
         for sid in [k for k, s in self._items.items() if now - s.last_seen > self._ttl and not busy(s)]:
             del self._items[sid]
         if len(self._items) > self._max:  # still too many: drop the least recently seen

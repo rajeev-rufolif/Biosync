@@ -22,6 +22,7 @@ Rules this module keeps:
 
 from __future__ import annotations
 
+import copy
 import logging
 import os
 import time
@@ -38,6 +39,7 @@ from sessions import Job, Session
 logger = logging.getLogger(__name__)
 
 MAX_CONCURRENT_JOBS = max(1, int(os.getenv("MAX_CONCURRENT_JOBS", "4")))
+MAX_UNDO = 5               # earlier schedules kept per session for undo
 JOB_BUDGET_S = 300          # wall-clock cap for one whole build
 _STRUCTURE_BUDGET_S = 90
 _SCHEDULE_BUDGET_S = 260
@@ -155,3 +157,80 @@ def _build(sess: Session, job: Job, snapshot: dict, creds: Credentials, started:
         result["warnings"] = warnings + result["warnings"]
         result["meta"].update(documents=len(docs), subjects_found=len(subjects))
     return result
+
+
+# ---------------------------------------------------------------------------
+# Revisions: edit a finished schedule from a change request
+# ---------------------------------------------------------------------------
+# Same machinery as a build (one background thread per job, credentials only in this call stack,
+# an outcome is always stored) but the old schedule is only replaced when the new one is valid.
+def start_revision(sess: Session, creds: Credentials | None, change_request: str,
+                   missing: llm_client.LLMError | None = None) -> tuple[Job | None, bool]:
+    """
+    Start revising the session's schedule. Returns (job, started):
+      (job, False)   a revision is already running (a double-tap never runs two);
+      (None, False)  there is no finished schedule to revise;
+      (job, True)    started (or, with creds=None, failed at once with `missing` / "no_key").
+    """
+    with sess.lock:
+        running = sess.revision_job
+        if running is not None and running.status == "generating":
+            return running, False
+        if sess.job is None or sess.job.status != "ready" or not (sess.schedule or {}).get("success"):
+            return None, False
+        job = Job(stage="revising")
+        sess.revision_job = job
+        if creds is None:
+            err = missing or llm_client.LLMError("no_key")
+            _finish_revision(sess, job, schedule_generator._failure(err.reason, err.message, provider=err.provider))
+            return job, True
+        snapshot = {
+            "schedule": copy.deepcopy(sess.schedule["schedule"]),
+            "answers": chat_handler.get_collected_answers(sess.chat_state),
+            "effort": llm_client.normalize_effort(sess.effort),
+            "request": change_request,
+        }
+    _submit(_run_revision, sess, job, snapshot, creds)
+    return job, True
+
+
+def _finish_revision(sess: Session, job: Job, result: dict) -> None:
+    """Store a revision's outcome. Caller holds sess.lock. A failed or unchanged revision leaves the schedule alone."""
+    job.stage, job.finished_at = "done", time.time()
+    if not result.get("success"):
+        job.status = "failed"
+        why = result.get("error") or llm_client.public_message("generation_failed")
+        sess.revision_outcome = {"id": job.id, "status": "rejected", "reason": result.get("reason"),
+                                 "message": f"I couldn't apply that change, so your schedule is unchanged. {why}"}
+        return
+    job.status = "ready"
+    notes = result.get("reasoning_notes") or ""
+    if result["schedule"] == sess.schedule.get("schedule"):
+        sess.revision_outcome = {"id": job.id, "status": "unchanged", "notes": notes,
+                                 "message": "Nothing in your schedule needed to change."}
+        return
+    sess.schedule_history.append(sess.schedule)
+    del sess.schedule_history[:-MAX_UNDO]
+    sess.schedule = result
+    sess.revision_outcome = {"id": job.id, "status": "applied", "notes": notes,
+                             "message": "Done, I've updated your schedule."}
+
+
+def _run_revision(sess: Session, job: Job, snapshot: dict, creds: Credentials) -> None:
+    tag = sess.sid[:8]
+    started = time.monotonic()
+    try:
+        result = schedule_generator.revise_schedule(
+            snapshot["schedule"], snapshot["answers"], snapshot["request"], effort=snapshot["effort"],
+            creds=creds, deadline=started + _SCHEDULE_BUDGET_S)
+    except Exception:  # noqa: BLE001 - the worker thread must always store an outcome
+        logger.exception("[%s] revision crashed", tag)
+        result = schedule_generator._failure(
+            "internal_error", llm_client.public_message("internal_error", creds.provider), provider=creds.provider)
+    with sess.lock:
+        if sess.revision_job is not job:
+            logger.info("[%s] revision finished after being replaced; result discarded", tag)
+            return
+        _finish_revision(sess, job, result)
+    logger.info("[%s] revision %s in %.1fs reason=%s", tag, job.status, time.monotonic() - started,
+                result.get("reason") or "-")
